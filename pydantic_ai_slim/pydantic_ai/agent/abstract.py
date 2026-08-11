@@ -2168,8 +2168,10 @@ class AgentRealtime(Generic[AgentDepsT]):
             toolsets=self._toolsets,
             capabilities=self._capabilities,
             usage=self._usage,
+            usage_limits=self._usage_limits,
             metadata=self._metadata,
             conversation_id=self._conversation_id,
+            run_id=self._run_id,
             message_history=self._message_history,
         ) as resolved:
             return await resolved.model.answer_webrtc_offer(
@@ -2209,8 +2211,10 @@ class AgentRealtime(Generic[AgentDepsT]):
             toolsets=self._toolsets,
             capabilities=self._capabilities,
             usage=self._usage,
+            usage_limits=self._usage_limits,
             metadata=self._metadata,
             conversation_id=self._conversation_id,
+            run_id=self._run_id,
             message_history=self._message_history,
         ) as resolved:
             return await resolved.model.create_client_secret(

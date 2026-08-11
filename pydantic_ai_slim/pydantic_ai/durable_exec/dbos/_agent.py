@@ -1185,15 +1185,16 @@ class DBOSAgent(WrapperAgent[AgentDepsT, OutputDataT], DBOSConfiguredInstance):
         """Resolve realtime configuration; backs the browser-call signaling helpers.
 
         Signaling issues a live provider request (and runs dynamic instructions and toolset setup to
-        build it), so like a realtime session itself it is non-deterministic and cannot be used
-        inside a DBOS workflow; calling them there raises a `UserError`. Outside a workflow they
-        delegate to the wrapped agent unchanged.
+        build it), so it is non-deterministic and cannot run in DBOS workflow code directly; calling
+        it there raises a `UserError`. Inside a step — where DBOS records non-deterministic I/O, the
+        same boundary `run()`/`run_stream()` use — and outside workflows entirely, it delegates to
+        the wrapped agent unchanged.
         """
-        if DBOS.workflow_id is not None:
+        if DBOS.workflow_id is not None and DBOS.step_id is None:
             raise UserError(
                 '`agent.realtime(...).answer_webrtc_offer()` and `.create_client_secret()` cannot be used '
-                'inside a DBOS workflow, as they issue non-deterministic provider requests. Use them '
-                'outside a workflow instead.'
+                'directly inside a DBOS workflow, as they issue non-deterministic provider requests. Call '
+                'them from inside a DBOS step, or outside the workflow.'
             )
         async with super()._resolve_realtime_session(
             model,

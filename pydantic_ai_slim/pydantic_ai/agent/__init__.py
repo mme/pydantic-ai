@@ -3355,6 +3355,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             else:
                 lifecycle_state.session._result = result  # pyright: ignore[reportPrivateUsage]
 
+        yielded = False
         async with AsyncExitStack() as session_stack:
             if lifecycle_state is not None:
                 lifecycle = await session_stack.enter_async_context(
@@ -3472,7 +3473,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 else None
             )
 
-            yield _RealtimeSessionResolution(
+            resolution = _RealtimeSessionResolution(
                 model=model,
                 run_context=run_context,
                 tool_manager=tool_manager,
@@ -3490,6 +3491,38 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 wrap_event_stream=wrap_event_stream,
                 lifecycle=lifecycle_state,
             )
+            try:
+                yield resolution
+            finally:
+                yielded = True
+
+        if yielded:
+            # Reached on the normal path, and when the run-lifecycle hooks suppressed a caller-side
+            # error that `wrap_run`/`on_run_error` recovered — the caller sees a clean exit either way.
+            return
+        # Entering the toolset or resolving the session configuration failed after the run-lifecycle
+        # hooks were entered, and `wrap_run`/`on_run_error` recovered with a result: the hooks
+        # suppressed the error above with nothing yielded yet, which `asynccontextmanager` would
+        # report as `RuntimeError: generator didn't yield`. Yield the short-circuit resolution shape
+        # instead, so `_open_realtime_session` yields its closed placeholder session carrying the
+        # recovery result.
+        assert lifecycle_state is not None and lifecycle_state.short_result is not None
+        yield _RealtimeSessionResolution(
+            model=model,
+            run_context=run_context,
+            tool_manager=ToolManager(FunctionToolset()),
+            tool_defs=[],
+            model_request_parameters=models.ModelRequestParameters(),
+            model_settings=effective_model_settings,
+            instructions=None,
+            request_messages=[],
+            model_profile=model_profile,
+            instrumentation_settings=session_instrumentation_settings,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            lifecycle=lifecycle_state,
+            short_circuited=True,
+        )
 
     @asynccontextmanager
     async def _open_realtime_session(
@@ -3532,6 +3565,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 "'transcript_only' (transcripts still build the conversation history)."
             )
 
+        yielded = False
         async with self._resolve_realtime_session(
             model,
             deps=deps,
@@ -3549,8 +3583,9 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         ) as resolved:
             lifecycle = resolved.lifecycle
             assert lifecycle is not None
-            if resolved.short_circuited:
-                # The session below is yielded closed, so `_ensure_not_closed` rejects every public
+
+            def _closed_session(result: AgentRunResult[Any]) -> RealtimeSession:
+                # The session is yielded closed, so `_ensure_not_closed` rejects every public
                 # entry point before the connection is touched; these raises are defense-in-depth
                 # for the abstract methods the base class requires.
                 class _SkippedRealtimeConnection(RealtimeConnection):
@@ -3575,10 +3610,13 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     run_id=resolved.run_id,
                     metadata=resolved.run_context.metadata,
                 )
-                assert lifecycle.short_result is not None
-                session._result = lifecycle.short_result  # pyright: ignore[reportPrivateUsage]
+                session._result = result  # pyright: ignore[reportPrivateUsage]
                 session._closed = True  # pyright: ignore[reportPrivateUsage]
-                yield session
+                return session
+
+            if resolved.short_circuited:
+                assert lifecycle.short_result is not None
+                yield _closed_session(lifecycle.short_result)
                 return
 
             if message_history and not resolved.model_profile.get('supports_session_seeding', False):
@@ -3648,7 +3686,21 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                 lifecycle.session = session
                 resolved.run_context.realtime_session = session
                 async with session:
-                    yield session
+                    try:
+                        yield session
+                    finally:
+                        yielded = True
+
+        if yielded:
+            # Reached on the normal path, and when the run-lifecycle hooks suppressed a session error
+            # that `wrap_run`/`on_run_error` recovered — the caller sees a clean exit either way.
+            return
+        # Opening the connection or building the session failed and `wrap_run`/`on_run_error`
+        # recovered with a result: the resolver's lifecycle hooks suppressed the error with nothing
+        # yielded yet, which `asynccontextmanager` would report as `RuntimeError: generator didn't
+        # yield`. Yield the short-circuit path's closed placeholder carrying the recovery result.
+        assert lifecycle.short_result is not None
+        yield _closed_session(lifecycle.short_result)
 
     async def __aenter__(self) -> Self:
         """Enter the agent context.
