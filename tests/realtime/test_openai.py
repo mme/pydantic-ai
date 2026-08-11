@@ -3258,6 +3258,30 @@ async def test_sideband_keeps_item_playing_past_response_done() -> None:
 
 
 @pytest.mark.anyio
+async def test_sideband_barge_in_clear_keeps_item_while_response_active() -> None:
+    """`output_audio_buffer.cleared` mid-response (our barge-in clear) must not retire the item.
+
+    The response is still open, so the truncation that follows the barge-in still names it; only an
+    end frame arriving *after* `response.done` retires the item.
+    """
+    ws = FakeWebSocket(
+        [
+            json.dumps({'type': 'response.created', 'response': {'id': 'resp_active'}}),
+            _content_part_added('item_active'),
+            _playback('output_audio_buffer.started'),
+            _playback('output_audio_buffer.cleared'),
+        ]
+    )
+    conn = OpenAIRealtimeConnection(ws, observes_output_audio=False)  # type: ignore[arg-type]
+    assert await collect_codec_events(conn, sideband=True) == [
+        RealtimeOutputSpeechStartEvent(),
+        RealtimeOutputSpeechEndEvent(),
+    ]
+    await conn.send(TruncateOutput(audio_end_ms=800))
+    assert json.loads(ws.sent[0])['item_id'] == 'item_active'
+
+
+@pytest.mark.anyio
 async def test_sideband_playback_end_retires_output_item() -> None:
     """Once playback ends after the response closed, there is nothing left to truncate."""
     ws = FakeWebSocket(
