@@ -5,7 +5,7 @@ from __future__ import annotations as _annotations
 from abc import abstractmethod
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol
 
@@ -65,6 +65,7 @@ class RealtimeClientSecret:
 
     value: str
     """The ephemeral secret to hand to the browser client."""
+    _: KW_ONLY
     expires_at: datetime
     """When the secret expires (timezone-aware UTC)."""
     provider_details: dict[str, Any] | None = None
@@ -103,6 +104,7 @@ class WebRTCSession:
 
     provider_name: str
     """The provider that owns the call (e.g. `'openai'` or `'azure'`); must match the model attaching to it."""
+    _: KW_ONLY
     session_id: str
     """The provider-assigned call identifier (OpenAI/Azure return it as the `call_id` in the `Location` header)."""
     provider_details: dict[str, Any] | None = None
@@ -124,6 +126,7 @@ class WebRTCAnswer:
 
     sdp: str
     """The provider's SDP answer, to send back to the browser as the remote description."""
+    _: KW_ONLY
     session: WebRTCSession
     """The call handle the server sideband session attaches to."""
 
