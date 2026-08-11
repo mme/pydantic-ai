@@ -86,6 +86,13 @@ short-lived credential for client-led negotiation. The browser is still a peer o
 session and can send provider-native control events, so authorize every server-side tool against
 trusted [`deps`](../dependencies.md), not session instructions supplied to the model.
 
+!!! warning "The browser can read seeded history"
+    Seeding a sideband session with [`message_history`](history.md) sends those prior turns into the
+    **shared** provider conversation that the browser is a peer on, so a call participant can read
+    them — including confidential tool results — over the data channel (Azure's `webrtcfilter=on`
+    still forwards conversation-item events). Only seed a sideband with history that is safe for the
+    browser to see; keep confidential context in [`deps`](../dependencies.md) and tool logic instead.
+
 A sideband does not own the audio transport. Its `send_audio()`, `commit_audio()`, `clear_audio()`,
 and `stream_audio()` methods raise, and `audio_retention` must remain `'transcript_only'`. Enable
 [input transcription](audio.md#input-transcription) when user speech must appear in history.
