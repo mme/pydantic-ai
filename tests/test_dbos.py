@@ -1136,13 +1136,23 @@ async def test_dbos_agent_realtime_session_in_workflow():
 
 
 async def test_dbos_agent_realtime_signaling_in_workflow():
-    # Browser-call signaling issues a live provider request, so it is guarded like a session: the two
-    # helpers reach the agent through `_resolve_realtime_session`, which the wrapper guards too.
+    # Browser-call signaling issues a live provider request, so workflow code can't call it directly:
+    # the two helpers reach the agent through `_resolve_realtime_session`, which the wrapper guards too.
     with patch.object(DBOS, 'workflow_id', 'wf-1'):
         realtime = simple_dbos_agent.realtime(cast('Any', object()))
-        with pytest.raises(UserError, match='cannot be used inside a DBOS workflow'):
+        with pytest.raises(UserError, match='cannot be used directly inside a DBOS workflow'):
             await realtime.answer_webrtc_offer('v=0')
-        with pytest.raises(UserError, match='cannot be used inside a DBOS workflow'):
+        with pytest.raises(UserError, match='cannot be used directly inside a DBOS workflow'):
+            await realtime.create_client_secret()
+
+
+async def test_dbos_agent_realtime_signaling_in_step():
+    # Inside a step — the boundary where DBOS records non-deterministic I/O — signaling delegates to
+    # the wrapped agent like `run()` does. The fake model has no WebRTC support, so reaching *its*
+    # refusal proves the workflow guard let the call through.
+    with patch.object(DBOS, 'workflow_id', 'wf-1'), patch.object(DBOS, 'step_id', 7):
+        realtime = simple_dbos_agent.realtime(_FakeRealtimeModel())
+        with pytest.raises(UserError, match='does not support WebRTC'):
             await realtime.create_client_secret()
 
 

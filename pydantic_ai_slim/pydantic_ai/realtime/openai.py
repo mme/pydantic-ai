@@ -630,6 +630,10 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         if event_type in _OUTPUT_SPEECH_END_FRAMES:
             was_playing, self._output_audio_playing = self._output_audio_playing, False
             self._output_speech_clear_sent = False
+            if not self._response_active:
+                # The response already closed; playback ending retires its output item (kept alive
+                # past `response.done` by `_clear_active_response` for barge-in truncation).
+                self._current_item_id = None
             return [] if self._observes_output_audio or not was_playing else [RealtimeOutputSpeechEndEvent()]
         # Drop trailing frames from a response we cancelled on barge-in (its audio/transcript deltas,
         # output-item events, etc.); its own `response.done` still passes through below to close the
@@ -831,7 +835,11 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         self._response_active = False
         self._active_response_id = None
         self._cancel_sent = False
-        self._current_item_id = None
+        # On a sideband, the provider keeps playing this response's audio to the browser after
+        # `response.done`, and a barge-in truncation during that tail still has to name the playing
+        # item — so it is retired when playback ends (`output_audio_buffer.stopped`/`.cleared`) instead.
+        if self._observes_output_audio or not self._output_audio_playing:
+            self._current_item_id = None
         self._generated_audio_bytes = 0
 
 

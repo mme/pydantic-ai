@@ -31,8 +31,9 @@ from pydantic_ai.realtime import (
     WebRTCSession,
 )
 from pydantic_ai.realtime.codec import RealtimeConnection
-from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import UsageLimits
 
 from ..conftest import try_import
 from .conftest import (
@@ -148,6 +149,28 @@ async def test_agent_realtime_signaling_resolves_bound_configuration() -> None:
         assert tools is not None
         assert [tool.name for tool in tools] == ['agent_tool', 'accessor_tool']
         assert settings == RealtimeModelSettings(max_tokens=100, output_modality='text')
+
+
+async def test_agent_realtime_signaling_resolves_bound_run_identity() -> None:
+    """Signaling resolves under the bound `run_id` and `usage_limits`.
+
+    Dynamic instructions and capability/toolset hooks then see the same run identity a later
+    `session()` on the same binding uses, so both push identical configuration.
+    """
+    model = _SignalingModel()
+    seen: list[tuple[str | None, int | None]] = []
+    agent = Agent(deps_type=type(None))
+
+    @agent.instructions
+    def record_run_identity(ctx: RunContext[None]) -> str:
+        assert ctx.usage_limits is not None
+        seen.append((ctx.run_id, ctx.usage_limits.tool_calls_limit))
+        return ''
+
+    realtime = agent.realtime(model, run_id='run-bound', usage_limits=UsageLimits(tool_calls_limit=3))
+    await realtime.create_client_secret()
+    await realtime.answer_webrtc_offer(SAMPLE_SDP_OFFER)
+    assert seen == [('run-bound', 3), ('run-bound', 3)]
 
 
 async def test_agent_realtime_signaling_unsupported_model() -> None:

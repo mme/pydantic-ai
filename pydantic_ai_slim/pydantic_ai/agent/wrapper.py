@@ -334,7 +334,14 @@ class WrapperAgent(AbstractAgent[AgentDepsT, OutputDataT]):
         message_history: Sequence[_messages.ModelMessage] | None = None,
         run_lifecycle: bool = False,
     ) -> AsyncGenerator[_RealtimeSessionResolution[AgentDepsT]]:
-        """Resolve realtime configuration on the wrapped agent."""
+        """Resolve realtime configuration on the wrapped agent.
+
+        This backs the WebRTC signaling helpers (`answer_webrtc_offer()` / `create_client_secret()`),
+        which bake the wrapped agent's instructions and tools into a provider call or browser
+        credential without opening a session — so a wrapper that gates realtime by overriding
+        `_open_realtime_session` (see its note below) must also override this method to gate
+        signaling.
+        """
         async with self.wrapped._resolve_realtime_session(
             model,
             deps=deps,

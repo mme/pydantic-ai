@@ -3226,15 +3226,11 @@ async def test_sideband_tracks_audio_part_and_playback_boundaries() -> None:
             _content_part_added('item_sideband', content_index=2),
             _content_part_added('ignored', part_type='text'),
             _playback('output_audio_buffer.started'),
-            _playback('output_audio_buffer.stopped'),
-            _playback('output_audio_buffer.cleared'),
         ]
     )
     conn = OpenAIRealtimeConnection(ws, observes_output_audio=False)  # type: ignore[arg-type]
-    assert await collect_codec_events(conn, sideband=True) == [
-        RealtimeOutputSpeechStartEvent(),
-        RealtimeOutputSpeechEndEvent(),
-    ]
+    assert await collect_codec_events(conn, sideband=True) == [RealtimeOutputSpeechStartEvent()]
+    # A barge-in truncation during playback names the tracked audio item and index.
     await conn.send(TruncateOutput(audio_end_ms=1200))
     assert json.loads(ws.sent[0]) == {
         'type': 'conversation.item.truncate',
@@ -3242,6 +3238,53 @@ async def test_sideband_tracks_audio_part_and_playback_boundaries() -> None:
         'content_index': 2,
         'audio_end_ms': 1200,
     }
+
+
+@pytest.mark.anyio
+async def test_sideband_keeps_item_playing_past_response_done() -> None:
+    """On a sideband, `response.done` must not retire the output item while its audio still plays.
+
+    The provider keeps streaming buffered audio to the browser after generation finishes, so a
+    barge-in `interrupt(played_ms=...)` in that tail still has to name the playing item; it is
+    retired when the provider reports playback over (`output_audio_buffer.stopped`/`.cleared`).
+    """
+    ws = FakeWebSocket([_content_part_added('item_tail'), _playback('output_audio_buffer.started')])
+    conn = OpenAIRealtimeConnection(ws, observes_output_audio=False)  # type: ignore[arg-type]
+    assert await collect_codec_events(conn, sideband=True) == [RealtimeOutputSpeechStartEvent()]
+    # Generation finished (`response.done` runs this) while playback continues: the item survives...
+    conn._clear_active_response()  # pyright: ignore[reportPrivateUsage]
+    await conn.send(TruncateOutput(audio_end_ms=800))
+    assert json.loads(ws.sent[0])['item_id'] == 'item_tail'
+
+
+@pytest.mark.anyio
+async def test_sideband_playback_end_retires_output_item() -> None:
+    """Once playback ends after the response closed, there is nothing left to truncate."""
+    ws = FakeWebSocket(
+        [
+            _content_part_added('item_done'),
+            _playback('output_audio_buffer.started'),
+            _playback('output_audio_buffer.stopped'),
+        ]
+    )
+    conn = OpenAIRealtimeConnection(ws, observes_output_audio=False)  # type: ignore[arg-type]
+    assert await collect_codec_events(conn, sideband=True) == [
+        RealtimeOutputSpeechStartEvent(),
+        RealtimeOutputSpeechEndEvent(),
+    ]
+    await conn.send(TruncateOutput(audio_end_ms=800))
+    assert ws.sent == []
+
+
+@pytest.mark.anyio
+async def test_websocket_clear_active_response_retires_output_item() -> None:
+    """A connection that observes output audio retires the item on `response.done` as before."""
+    ws = FakeWebSocket([_audio_delta('item_ws')])
+    conn = OpenAIRealtimeConnection(ws)  # type: ignore[arg-type]
+    _ = await collect_codec_events(conn)
+    conn._clear_active_response()  # pyright: ignore[reportPrivateUsage]
+    await conn.send(TruncateOutput(audio_end_ms=800))
+    assert ws.sent == []
 
 
 @pytest.mark.anyio
