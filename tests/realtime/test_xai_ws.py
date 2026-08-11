@@ -25,6 +25,9 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
     ModelRequest,
     ModelResponse,
+    PartDeltaEvent,
+    PartStartEvent,
+    RealtimeSessionErrorEvent,
     SpeechPart,
     SpeechPartDelta,
     TextPart,
@@ -33,14 +36,10 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.realtime import (
-    PartDeltaEvent,
-    PartStartEvent,
     RealtimeModelProfile,
     RealtimeSessionReconnectEvent,
     RealtimeTurnCompleteEvent,
-    ReconnectPolicy,
 )
-from pydantic_ai.realtime._base import RealtimeSessionErrorEvent
 
 from ..conftest import IsDatetime, IsStr, try_import
 from .ws_cassettes import CassetteClose, CassetteMessage, RealtimeCassette
@@ -322,8 +321,6 @@ async def test_tool_call_round(xai_ws_cassette: tuple[XaiProvider, RealtimeCasse
             tool_name='get_weather',
             args=IsStr(),
             tool_call_id=IsStr(),
-            id=IsStr(),
-            provider_name='xai',
         )
     ]
     assert (tool_response.usage.input_tokens, tool_response.usage.output_tokens) == (7, 113)
@@ -412,7 +409,7 @@ async def test_message_history_seeding(xai_ws_cassette: tuple[XaiProvider, Realt
 async def test_session_resumption_after_drop(xai_ws_cassette: tuple[XaiProvider, RealtimeCassette]) -> None:
     """A forced WebSocket drop resumes the native xAI conversation without duplicating prior turns."""
     provider, cassette = xai_ws_cassette
-    model = XaiRealtimeModel(MODEL, provider=provider, reconnect=ReconnectPolicy(base_delay=0.0, jitter=False))
+    model = XaiRealtimeModel(MODEL, provider=provider, settings={'reconnect': {'base_delay': 0.0, 'jitter': False}})
     agent = Agent(instructions='Answer in one short sentence.')
 
     events: list[Any] = []
@@ -514,6 +511,7 @@ def test_profile_allow_seeding() -> None:
         supports_async_tool_calls=False,
         supports_tool_return_schema=False,
         supported_native_tools=frozenset(),
+        emits_input_speech_events=True,
         audio_input_sample_rate=24000,
         audio_output_sample_rate=24000,
     )

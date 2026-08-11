@@ -327,9 +327,12 @@ class WrapperAgent(AbstractAgent[AgentDepsT, OutputDataT]):
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
         usage: _usage.RunUsage | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
         metadata: AgentMetadata[AgentDepsT] | None = None,
         conversation_id: str | None = None,
+        run_id: str | None = None,
         message_history: Sequence[_messages.ModelMessage] | None = None,
+        run_lifecycle: bool = False,
     ) -> AsyncGenerator[_RealtimeSessionResolution[AgentDepsT]]:
         """Resolve realtime configuration on the wrapped agent."""
         async with self.wrapped._resolve_realtime_session(
@@ -340,9 +343,12 @@ class WrapperAgent(AbstractAgent[AgentDepsT, OutputDataT]):
             toolsets=toolsets,
             capabilities=capabilities,
             usage=usage,
+            usage_limits=usage_limits,
             metadata=metadata,
             conversation_id=conversation_id,
+            run_id=run_id,
             message_history=message_history,
+            run_lifecycle=run_lifecycle,
         ) as resolved:
             yield resolved
 
@@ -367,7 +373,12 @@ class WrapperAgent(AbstractAgent[AgentDepsT, OutputDataT]):
         retain_images_max: int | None = 100,
         provider_session: RealtimeProviderSession | None = None,
     ) -> AsyncGenerator[RealtimeSession]:
-        """Open a realtime session on the wrapped agent. See [`Agent.realtime`][pydantic_ai.agent.Agent.realtime]."""
+        """Open a realtime session on the wrapped agent. See [`Agent.realtime`][pydantic_ai.agent.Agent.realtime].
+
+        Note that realtime sessions do not route through [`iter()`][pydantic_ai.agent.AbstractAgent.iter]
+        (there is no graph run to iterate), so a wrapper that enforces policy by overriding `iter()`
+        must also override this method to gate realtime sessions.
+        """
         async with self.wrapped._open_realtime_session(
             model,
             deps=deps,

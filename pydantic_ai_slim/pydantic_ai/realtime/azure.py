@@ -4,29 +4,18 @@ from __future__ import annotations as _annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, ClassVar, Literal, Protocol, cast
 from urllib.parse import urlencode, urlparse, urlunparse
 
 from anyio.to_thread import run_sync
 from openai import AsyncOpenAI
 from openai.types.realtime.realtime_audio_config_output import VoiceID
+from pydantic import BaseModel
 
 from ..exceptions import UserError
 from ..providers import Provider, infer_provider
 from ..providers.azure import AzureProvider
 from ..tools import ToolDefinition
-from ._base import (
-    OutputTranscript,
-    RealtimeClientSecret,
-    RealtimeCodecEvent,
-    RealtimeModelProfile,
-    RealtimeModelProfileSpec,
-    RealtimeModelSettings,
-    ReconnectPolicy,
-    WebRTCAnswer,
-    merge_realtime_profile,
-    resolve_advertised_tools,
-)
 from ._openai_protocol import (
     SemanticVAD,
     ServerVAD,
@@ -39,7 +28,17 @@ from ._openai_protocol import (
     with_realtime_query,
 )
 from ._openai_webrtc import relay_sdp_offer as _relay_sdp_offer
-from .openai import OpenAIRealtimeConnection, OpenAIRealtimeModel, OpenAIRealtimeModelSettings
+from ._utils import resolve_advertised_tools
+from .codec import OutputTranscript, RealtimeCodecEvent
+from .model import RealtimeClientSecret, WebRTCAnswer
+from .openai import (
+    OpenAIRealtimeConnection,
+    OpenAIRealtimeModel,
+    OpenAIRealtimeModelName,
+    OpenAIRealtimeModelSettings,
+)
+from .profiles import RealtimeModelProfile, RealtimeModelProfileSpec, merge_realtime_profile
+from .settings import RealtimeModelSettings
 
 __all__ = (
     'AzureRealtimeModel',
@@ -47,6 +46,12 @@ __all__ = (
     'AzureRealtimeModelSettings',
     'AzureTokenCredential',
 )
+
+LatestAzureRealtimeModelNames = Literal['gpt-realtime']
+AzureRealtimeModelName = OpenAIRealtimeModelName
+
+LatestAzureRealtimeTranscriptionModelNames = Literal['azure-speech', 'mai-transcribe']
+AzureRealtimeTranscriptionModelName = str | LatestAzureRealtimeTranscriptionModelNames
 
 
 class AzureRealtimeConnection(OpenAIRealtimeConnection):
@@ -66,18 +71,11 @@ class _AccessToken(Protocol):
 
 
 class AzureTokenCredential(Protocol):
-    """Structural type for a Microsoft Entra ID credential, e.g. `azure.identity.DefaultAzureCredential`.
-
-    Any object with a synchronous `get_token(*scopes) -> token` method (the `azure-core`
-    `TokenCredential` interface) is accepted, so `AzureRealtimeModel` doesn't depend on `azure-identity`.
-    """
+    """Structural type for a synchronous Microsoft Entra ID token credential."""
 
     def get_token(self, *scopes: str, **kwargs: Any) -> _AccessToken: ...
 
 
-# Microsoft Entra ID token scope for the Azure OpenAI data plane, per the Azure realtime WebRTC guide.
-# Minting a realtime client secret (or relaying a WebRTC offer) with a `DefaultAzureCredential` token
-# requires the caller to hold the "Cognitive Services User" role on the resource.
 _ENTRA_SCOPE = 'https://ai.azure.com/.default'
 
 
@@ -114,6 +112,16 @@ class AzureRealtimeModelSettings(OpenAIRealtimeModelSettings, total=False):
     """
     azure_voice_live_turn_detection: ServerVAD | SemanticVAD
     """Voice Live server or semantic VAD config; only applies when `azure_voice_live=True`."""
+
+
+class _VoiceLiveSession(BaseModel):
+    model: str | None = None
+
+
+class _VoiceLiveSessionCreated(BaseModel):
+    """The narrow slice of Voice Live's beta `session.created` frame the handshake reads."""
+
+    session: _VoiceLiveSession
 
 
 def _map_voice_live_event(data: dict[str, Any]) -> RealtimeCodecEvent | None:
@@ -169,18 +177,15 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
     """
 
     _connection_type: ClassVar[type[OpenAIRealtimeConnection]] = AzureRealtimeConnection
-
     credential: AzureTokenCredential | None = None
-    """Microsoft Entra ID credential; when set, every request to the resource uses a bearer token."""
 
     def __init__(
         self,
-        model: str = 'gpt-realtime',
+        model: AzureRealtimeModelName,
         *,
         provider: Provider[AsyncOpenAI] | str = 'azure',
         settings: RealtimeModelSettings | None = None,
         profile: RealtimeModelProfileSpec | None = None,
-        reconnect: ReconnectPolicy | None = None,
         credential: AzureTokenCredential | None = None,
     ) -> None:
         """Create an Azure OpenAI realtime model.
@@ -190,22 +195,17 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
                 use. Azure deployments are conventionally named after their model; when yours isn't,
                 `profile` is how to correct the facts inferred from the name.
             provider: The provider supplying the resource endpoint and API key. Defaults to `'azure'`.
-            settings: Model settings used as defaults for realtime sessions.
+            settings: [Model settings][pydantic_ai.realtime.RealtimeModelSettings] used as defaults
+                for realtime sessions.
             profile: Optional override for the [realtime model profile][pydantic_ai.realtime.RealtimeModelProfile],
                 merged over the provider's — a partial dict, or a callable taking the resolved profile
                 and returning the one to use.
-            reconnect: Optional [`ReconnectPolicy`][pydantic_ai.realtime.ReconnectPolicy] to
-                transparently recover from a dropped connection.
-            credential: Optional Microsoft Entra ID credential (e.g. `azure.identity.DefaultAzureCredential()`).
-                When set, the realtime WebSocket session *and* the browser WebRTC signaling calls
-                authenticate with a bearer token instead of the resource `api-key`.
+            credential: Optional Microsoft Entra ID credential. When set, realtime requests use its
+                bearer tokens instead of the resource API key.
         """
         if credential is not None and provider == 'azure':
-            # An Entra credential authenticates every request, so the resource key is never read — and a
-            # resource locked to managed identity has none to give. Build the default provider knowing
-            # that, rather than demanding `AZURE_OPENAI_API_KEY` for a value this model won't use.
             provider = AzureProvider.for_realtime(entra_authenticated=True)
-        super().__init__(model, provider=provider, settings=settings, profile=profile, reconnect=reconnect)
+        super().__init__(model, provider=provider, settings=settings, profile=profile)
         self.credential = credential
 
     @staticmethod
@@ -242,7 +242,7 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
         return urlunparse(parsed._replace(scheme='wss', path='/openai/v1/realtime', query=''))
 
     def _realtime_url(self, model_settings: OpenAIRealtimeModelSettings | None = None) -> str:
-        if model_settings and model_settings.get('azure_voice_live'):
+        if model_settings and cast('AzureRealtimeModelSettings', model_settings).get('azure_voice_live'):
             # Voice Live is a distinct resource with its own coherent endpoint/version (see
             # `AzureProvider.voice_live_*`); never the GA endpoint or a hard-coded version.
             parsed = urlparse(self._azure_provider.voice_live_endpoint)
@@ -256,17 +256,10 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
         return with_realtime_query(self._realtime_ws_base(), model=self.model)
 
     def _webrtc_http_base(self) -> str:
-        # Azure exposes the WebRTC signaling endpoints under the GA `/openai/v1/` path, regardless of the
-        # `api_version`/path the provider's `base_url` carries. Deriving from `azure_endpoint` (rather than
-        # inheriting the OpenAI behavior of appending to `base_url`) forces `/openai/v1/` here just as
-        # `_realtime_ws_base` does for the WebSocket handshake — without it, signaling URLs silently drop
-        # the `/v1` and Azure 404s. Always ends in `/` so callers can append `realtime/...`.
         parsed = urlparse(self._azure_provider.azure_endpoint)
         return urlunparse(parsed._replace(scheme='https', path='/openai/v1/', query=''))
 
     def _webrtc_calls_url(self) -> str:
-        # `webrtcfilter=on` restricts the events forwarded to the browser data channel to a safe subset,
-        # keeping the session instructions and tool traffic on the server's control connection only.
         return self._webrtc_url('realtime/calls', webrtcfilter='on')
 
     async def answer_webrtc_offer(
@@ -277,10 +270,6 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
         tools: Sequence[ToolDefinition] | None = None,
         model_settings: RealtimeModelSettings | None = None,
     ) -> WebRTCAnswer:
-        # Azure's `/realtime/calls` rejects the resource api-key / Entra token with a 401 (`This operation
-        # requires ephemeral tokens`). So — unlike OpenAI's single-step multipart relay — Azure negotiates
-        # in two steps: mint a short-lived client secret server-side (with the api-key or Entra token),
-        # which binds the session config, then relay the raw SDP offer authenticated with that secret.
         secret = await self.create_client_secret(instructions=instructions, tools=tools, model_settings=model_settings)
         return await _relay_sdp_offer(
             http_client=self._http_client,
@@ -322,18 +311,19 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
         self,
         instructions: str,
         tools: list[ToolDefinition] | None,
+        *,
         model_settings: OpenAIRealtimeModelSettings | None,
     ) -> dict[str, Any]:
         settings = cast('AzureRealtimeModelSettings', self._merge_model_settings(model_settings) or {})
         if not settings.get('azure_voice_live'):
-            return super()._session_config(instructions, tools, settings)
+            return super()._session_config(instructions, tools, model_settings=settings)
 
         if 'azure_voice_live_turn_detection' in settings:
-            turn_detection = settings['azure_voice_live_turn_detection']
+            turn_detection: ServerVAD | SemanticVAD | None = settings['azure_voice_live_turn_detection']
         elif 'turn_detection' in settings:
             turn_detection = resolve_base_turn_detection(settings['turn_detection'])
         else:
-            turn_detection = ServerVAD()
+            turn_detection = ServerVAD(type='server_vad')
         auto_transcription_model = 'whisper-1' if self.model.startswith('gpt-realtime') else 'azure-speech'
         transcription_model = resolve_transcription_model(
             settings.get('input_transcription_model', 'auto'), default=auto_transcription_model
@@ -343,7 +333,7 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
             'modalities': ['text'] if settings.get('output_modality') == 'text' else ['text', 'audio'],
             'input_audio_format': 'pcm16',
             'output_audio_format': 'pcm16',
-            'input_audio_sampling_rate': 24000,
+            'input_audio_sampling_rate': self.profile.get('audio_input_sample_rate', 24000),
             'turn_detection': turn_detection_config(turn_detection),
         }
         if transcription_model is not None:
@@ -367,10 +357,17 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
         return config
 
     def _connection_class(self, model_settings: OpenAIRealtimeModelSettings) -> type[OpenAIRealtimeConnection]:
-        if model_settings.get('azure_voice_live'):
+        if cast('AzureRealtimeModelSettings', model_settings).get('azure_voice_live'):
             return _VoiceLiveRealtimeConnection
         # The GA path: `_connection_type`, i.e. the Azure-labeled connection.
         return super()._connection_class(model_settings)
+
+    def _session_model_name(self, created: dict[str, Any], model_settings: OpenAIRealtimeModelSettings) -> str | None:
+        if cast('AzureRealtimeModelSettings', model_settings).get('azure_voice_live'):
+            # Voice Live's beta `session.created` has no GA `type` discriminator, so the SDK's
+            # `SessionCreatedEvent` rejects it; validate the narrow slice actually read instead.
+            return _VoiceLiveSessionCreated.model_validate(created).session.model
+        return super()._session_model_name(created, model_settings)
 
     async def _auth_headers(self, model_settings: OpenAIRealtimeModelSettings | None = None) -> dict[str, str]:
         if (credential := self.credential) is not None:
@@ -379,6 +376,6 @@ class AzureRealtimeModel(OpenAIRealtimeModel):
             token = await run_sync(lambda: credential.get_token(_ENTRA_SCOPE))
             return {'Authorization': f'Bearer {token.token}'}
         # A Voice Live session authenticates against the Voice Live resource, so use its coherent key.
-        if model_settings and model_settings.get('azure_voice_live'):
+        if model_settings and cast('AzureRealtimeModelSettings', model_settings).get('azure_voice_live'):
             return {'api-key': self._azure_provider.voice_live_api_key}
         return {'api-key': self._azure_provider.api_key}

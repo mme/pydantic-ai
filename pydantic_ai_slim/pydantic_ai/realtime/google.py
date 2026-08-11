@@ -3,11 +3,11 @@
 Built on the `google-genai` SDK, which manages the WebSocket transport for you. Available via the
 `google` optional group:
 
-    pip install "pydantic-ai-slim[google]"
+    pip install "pydantic-ai-slim[google-realtime]"
 
 Unlike the OpenAI provider, Gemini wants **16 kHz** PCM input audio (output is 24 kHz), produces a
 single response modality per session (audio *or* text), and natively accepts a stream of video
-frames sent as `ImageInput`.
+frames sent as [`BinaryImage`][pydantic_ai.messages.BinaryImage].
 
 Use `provider='google'` for the Gemini Developer API, or `provider='google-cloud'` /
 [`GoogleCloudProvider`][pydantic_ai.providers.google_cloud.GoogleCloudProvider] for Google Cloud with
@@ -16,17 +16,15 @@ Application Default Credentials.
 
 from __future__ import annotations as _annotations
 
-import json
-import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Sequence
 from contextlib import AbstractAsyncContextManager, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, Literal, cast
-from urllib.parse import quote
 
 from anyio import Lock
 from anyio.lowlevel import RunVar
-from typing_extensions import assert_never
+from pydantic_core import to_json
+from typing_extensions import TypedDict, assert_never
 
 try:
     import websockets
@@ -35,7 +33,7 @@ try:
 except ImportError as _import_error:
     raise ImportError(
         'Please install the `google-genai` package to use the Gemini realtime model, '
-        'you can use the `google` optional group - `pip install "pydantic-ai-slim[google]"`'
+        'you can use the `google-realtime` optional group - `pip install "pydantic-ai-slim[google-realtime]"`'
     ) from _import_error
 
 from .._instrumentation import get_instructions
@@ -43,7 +41,9 @@ from .._utils import generate_tool_call_id
 from ..exceptions import ModelHTTPError, UserError
 from ..messages import (
     AudioUrl,
+    BinaryAudio,
     BinaryContent,
+    BinaryImage,
     CachePoint,
     CompactionPart,
     DocumentUrl,
@@ -57,6 +57,9 @@ from ..messages import (
     NativeToolReturnPart,
     PartEndEvent,
     PartStartEvent,
+    RealtimeResponseInterruptedEvent,
+    RealtimeSessionErrorEvent,
+    RealtimeSessionReconnectEvent,
     RetryPromptPart,
     SpeechPart,
     SystemPromptPart,
@@ -86,44 +89,44 @@ from ..models.google import (
 )
 from ..native_tools import AbstractNativeTool, CodeExecutionTool, WebFetchTool, WebSearchTool
 from ..profiles import DEFAULT_THINKING_TAGS
-from ..profiles.google import GoogleOpenAPISchemaTransformer
+from ..profiles.google import (
+    GoogleOpenAPISchemaTransformer,
+    _drop_unsupported_schema_keywords,  # pyright: ignore[reportPrivateUsage]
+)
 from ..providers import Provider, infer_provider
-from ..providers.gateway import is_gateway_provider
 from ..settings import ThinkingLevel
 from ..tools import ToolDefinition
 from ..usage import RequestUsage
-from ._base import (
-    DEFAULT_REALTIME_PROFILE,
-    AudioDelta,
-    AudioInput,
-    ImageInput,
-    InputTranscript,
-    OutputTranscript,
-    RealtimeCodecEvent,
-    RealtimeConnection,
-    RealtimeError,
-    RealtimeInput,
-    RealtimeModel,
-    RealtimeModelProfile,
-    RealtimeModelProfileSpec,
-    RealtimeModelSettings,
-    RealtimeResponseInterruptedEvent,
-    RealtimeSessionErrorEvent,
-    RealtimeSessionReconnectEvent,
-    ReconnectPolicy,
-    ResponseDone,
-    SessionUsageEvent,
-    TextInput,
-    ToolCall,
-    ToolCallCancelled,
-    ToolResult,
-    TurnDetection,
+from ._utils import (
     inject_trace_context,
     reconnect_with_backoff,
+    require_pcm_audio,
     resolve_advertised_tools,
     seed_speech_content,
     seed_user_content,
 )
+from .codec import (
+    AudioDelta,
+    InputTranscript,
+    OutputTranscript,
+    RealtimeCodecEvent,
+    RealtimeConnection,
+    RealtimeInput,
+    ResponseDone,
+    SessionUsage,
+    ToolCall,
+    ToolCallCancelled,
+    ToolResult,
+)
+from .model import RealtimeError, RealtimeModel
+from .profiles import DEFAULT_REALTIME_PROFILE, RealtimeModelProfile, RealtimeModelProfileSpec
+from .settings import RealtimeModelSettings, ReconnectPolicy, TurnDetection
+
+LatestGoogleRealtimeModelNames = Literal[
+    'gemini-2.5-flash-native-audio-latest',
+    'gemini-3.1-flash-live-preview',
+]
+GoogleRealtimeModelName = str | LatestGoogleRealtimeModelNames
 
 __all__ = (
     'GoogleRealtimeModel',
@@ -133,6 +136,46 @@ __all__ = (
     'MultiSpeaker',
     'ContextCompression',
 )
+
+
+class AutomaticVAD(TypedDict, total=False):
+    """Server-side voice activity detection — the default turn-taking mode for Gemini Live."""
+
+    disabled: bool
+    """Turn off automatic VAD entirely. Defaults to `False`.
+
+    Do not set this through `RealtimeSession`: Pydantic AI does not expose Gemini activity markers or
+    manual turn controls. Use automatic VAD instead; the shared `turn_detection=False` setting is
+    rejected for the same reason.
+    """
+    start_sensitivity: Literal['high', 'low']
+    """How readily speech onset is detected. `high` triggers on quieter audio; `low` is stricter.
+    Defaults to the provider default."""
+    end_sensitivity: Literal['high', 'low']
+    """How readily the end of speech is detected. `high` ends turns sooner; `low` waits longer.
+    Defaults to the provider default."""
+    prefix_padding_ms: int
+    """Audio to include before detected speech, in milliseconds. Defaults to the provider default."""
+    silence_duration_ms: int
+    """Silence required to detect the end of speech, in milliseconds. Defaults to the provider default."""
+
+
+class MultiSpeaker(TypedDict, total=False):
+    """Assign prebuilt voices to named speakers for multi-speaker audio output."""
+
+    voices: dict[str, str]
+    """Mapping of speaker label to prebuilt voice name, e.g. `{'Joe': 'Puck', 'Jane': 'Kore'}`.
+    Defaults to an empty mapping."""
+
+
+class ContextCompression(TypedDict, total=False):
+    """Sliding-window context compression so long sessions don't exceed the context window."""
+
+    trigger_tokens: int
+    """Compress once the context passes this many tokens. Defaults to the provider default."""
+    target_tokens: int
+    """Target size (in tokens) of the retained sliding window after compression.
+    Defaults to the provider default."""
 
 
 class GoogleRealtimeModelSettings(RealtimeModelSettings, total=False):
@@ -187,7 +230,7 @@ class GoogleRealtimeModelSettings(RealtimeModelSettings, total=False):
     """Gemini-specific server-side voice activity detection settings.
 
     When present, this fully overrides the cross-provider `turn_detection` setting.
-    `AutomaticVAD(disabled=True)` raises a `UserError`, like `turn_detection=False`: Pydantic AI does
+    `google_vad={'disabled': True}` raises a `UserError`, like `turn_detection=False`: Pydantic AI does
     not expose Gemini activity markers or manual turn controls, so the resulting session could not
     drive turns.
     """
@@ -203,7 +246,15 @@ class GoogleRealtimeModelSettings(RealtimeModelSettings, total=False):
     """Raw values merged last into the Google `LiveConnectConfig`."""
 
     google_enable_session_resumption: bool
-    """Whether to request session-resumption handles. Defaults to `False`."""
+    """Whether to request session-resumption handles, which let a re-dial restore the server-side
+    conversation.
+
+    When absent, handles are requested exactly when a
+    [`reconnect`][pydantic_ai.realtime.RealtimeModelSettings.reconnect] policy is set. An explicit
+    `False` cannot be combined with a `reconnect` policy: a re-dial without resumption would lose the
+    conversation, so `connect` raises [`UserError`][pydantic_ai.exceptions.UserError] rather than
+    silently reconnecting into a model that remembers nothing.
+    """
 
     google_async_tool_calls: bool
     """Whether tool calls may run without pausing the model's speech. Defaults to `False`.
@@ -225,47 +276,6 @@ class GoogleRealtimeModelSettings(RealtimeModelSettings, total=False):
 
 INPUT_SAMPLE_RATE = 16000
 """Sample rate (Hz) Gemini expects for PCM16 input audio."""
-
-
-@dataclass
-class AutomaticVAD:
-    """Server-side voice activity detection — the default turn-taking mode for Gemini Live."""
-
-    _: KW_ONLY
-    disabled: bool = False
-    """Turn off automatic VAD entirely.
-
-    Do not set this through `RealtimeSession`: Pydantic AI does not expose Gemini activity markers or
-    manual turn controls. Use automatic VAD instead; the shared `turn_detection=False` setting is
-    rejected for the same reason.
-    """
-    start_sensitivity: Literal['high', 'low'] | None = None
-    """How readily speech onset is detected. `high` triggers on quieter audio; `low` is stricter."""
-    end_sensitivity: Literal['high', 'low'] | None = None
-    """How readily the end of speech is detected. `high` ends turns sooner; `low` waits longer."""
-    prefix_padding_ms: int | None = None
-    """Audio to include before detected speech, in milliseconds."""
-    silence_duration_ms: int | None = None
-    """Silence required to detect the end of speech, in milliseconds."""
-
-
-@dataclass
-class MultiSpeaker:
-    """Assign prebuilt voices to named speakers for multi-speaker audio output."""
-
-    voices: dict[str, str]
-    """Mapping of speaker label to prebuilt voice name, e.g. `{'Joe': 'Puck', 'Jane': 'Kore'}`."""
-
-
-@dataclass
-class ContextCompression:
-    """Sliding-window context compression so long sessions don't exceed the context window."""
-
-    _: KW_ONLY
-    trigger_tokens: int | None = None
-    """Compress once the context passes this many tokens; `None` uses the provider default."""
-    target_tokens: int | None = None
-    """Target size (in tokens) of the retained sliding window after compression."""
 
 
 # Literal -> SDK enum mappings, kept as small tables so the public API stays string-friendly.
@@ -328,13 +338,16 @@ def _thinking_to_config(thinking: ThinkingLevel) -> genai_types.ThinkingConfig:
 
 def _automatic_vad_from_turn_detection(turn_detection: TurnDetection) -> AutomaticVAD:
     """Map cross-provider turn detection to Gemini's automatic-VAD shape."""
-    sensitivity = turn_detection.sensitivity if turn_detection.sensitivity != 'medium' else None
-    return AutomaticVAD(
-        start_sensitivity=sensitivity,
-        end_sensitivity=sensitivity,
-        prefix_padding_ms=turn_detection.prefix_padding_ms,
-        silence_duration_ms=turn_detection.silence_duration_ms,
-    )
+    sensitivity = turn_detection.get('sensitivity')
+    result: AutomaticVAD = {}
+    if sensitivity is not None and sensitivity != 'medium':
+        result['start_sensitivity'] = sensitivity
+        result['end_sensitivity'] = sensitivity
+    if (prefix_padding_ms := turn_detection.get('prefix_padding_ms')) is not None:
+        result['prefix_padding_ms'] = prefix_padding_ms
+    if (silence_duration_ms := turn_detection.get('silence_duration_ms')) is not None:
+        result['silence_duration_ms'] = silence_duration_ms
+    return result
 
 
 async def _seed_turns(
@@ -355,18 +368,16 @@ async def _seed_turns(
     """
     turns: list[genai_types.Content | genai_types.ContentDict] = []
     supports_images = profile.get('supports_seeding_images', False)
-    supports_audio = profile.get('supports_seeding_audio', False)
     for message in messages:
         if isinstance(message, ModelRequest):
             parts = await _seed_request_parts(
                 message.parts,
                 provider_name=provider_name,
                 supports_images=supports_images,
-                supports_audio=supports_audio,
             )
             role = 'user'
         else:
-            parts = _seed_response_parts(message.parts, provider_name=provider_name, supports_audio=supports_audio)
+            parts = _seed_response_parts(message.parts, provider_name=provider_name)
             role = 'model'
         if parts:
             turns.append(genai_types.Content(role=role, parts=parts))
@@ -378,7 +389,6 @@ async def _seed_request_parts(
     *,
     provider_name: str,
     supports_images: bool,
-    supports_audio: bool,
 ) -> list[genai_types.Part]:
     parts: list[genai_types.Part] = []
     for part in message_parts:
@@ -389,22 +399,23 @@ async def _seed_request_parts(
         elif isinstance(part, UserPromptPart):
             parts.extend(
                 _genai_user_parts(
-                    await seed_user_content(part, provider_name=provider_name, supports_images=supports_images)
+                    await seed_user_content(part=part, provider_name=provider_name, supports_images=supports_images)
                 )
             )
         elif isinstance(part, SpeechPart):
-            content = seed_speech_content(part, provider_name=provider_name, supports_audio=supports_audio)
-            assert isinstance(content, str)
+            # Gemini has no client-content channel for raw audio, so seeding never replays retained
+            # audio regardless of profile flags — the typed result is always a transcript string.
+            content = seed_speech_content(part=part, provider_name=provider_name, supports_audio=False)
             if content:
                 parts.append(genai_types.Part(text=content))
         elif isinstance(part, ToolReturnPart):
             output, user_content = part.model_response_str_and_user_content()
-            parts.append(genai_types.Part(text=f'[Tool "{part.tool_name}" returned: {output}]'))
+            parts.append(genai_types.Part(text=f'[Tool {part.tool_call_id}: {part.tool_name} returned: {output}]'))
             if user_content:
                 parts.extend(
                     _genai_user_parts(
                         await seed_user_content(
-                            UserPromptPart(content=user_content),
+                            part=UserPromptPart(content=user_content),
                             provider_name=provider_name,
                             supports_images=supports_images,
                         )
@@ -412,16 +423,14 @@ async def _seed_request_parts(
                 )
         elif isinstance(part, RetryPromptPart):
             output = part.model_response()
-            text = output if part.tool_name is None else f'[Tool "{part.tool_name}" error: {output}]'
+            text = output if part.tool_name is None else f'[Tool {part.tool_call_id}: {part.tool_name} error: {output}]'
             parts.append(genai_types.Part(text=text))
         else:
             assert_never(part)
     return parts
 
 
-def _seed_response_parts(
-    message_parts: Sequence[ModelResponsePart], *, provider_name: str, supports_audio: bool
-) -> list[genai_types.Part]:
+def _seed_response_parts(message_parts: Sequence[ModelResponsePart], *, provider_name: str) -> list[genai_types.Part]:
     parts: list[genai_types.Part] = []
     for part in message_parts:
         if isinstance(part, TextPart):
@@ -432,13 +441,15 @@ def _seed_response_parts(
                 start_tag, end_tag = DEFAULT_THINKING_TAGS
                 parts.append(genai_types.Part(text='\n'.join([start_tag, part.content, end_tag])))
         elif isinstance(part, ToolCallPart):
-            parts.append(genai_types.Part(text=f'[Tool call: {part.tool_name}({part.args_as_json_str()})]'))
+            parts.append(
+                genai_types.Part(text=f'[Tool {part.tool_call_id}: {part.tool_name}({part.args_as_json_str()})]')
+            )
         elif isinstance(part, (NativeToolCallPart, NativeToolReturnPart)):
             continue
         elif isinstance(part, SpeechPart):
-            content = seed_speech_content(part, provider_name=provider_name, supports_audio=supports_audio)
+            # Assistant audio can't be replayed on any provider; the typed result is a transcript string.
+            content = seed_speech_content(part=part, provider_name=provider_name, supports_audio=False)
             if content:
-                assert isinstance(content, str)
                 parts.append(genai_types.Part(text=content))
         elif isinstance(part, CompactionPart):
             # Provider-session-bound compaction state can't round-trip into another session; classic
@@ -464,88 +475,6 @@ def _genai_user_parts(content: Sequence[str | BinaryContent]) -> list[genai_type
     ]
 
 
-# The keywords `genai_types.Schema` accepts. It forbids every other one outright, so a constraint
-# with no OpenAPI-subset equivalent — `multipleOf` from `Field(multiple_of=...)`, `uniqueItems` from
-# a `set[str]` — has to come off before validation or it would fail the session's setup rather than
-# just go unenforced. Read off the model so a field the SDK gains is honored without a change here.
-_SCHEMA_KEYWORDS = frozenset(field.alias or name for name, field in genai_types.Schema.model_fields.items())
-
-# Keywords whose value is itself a schema, a list of schemas, or a map of names to schemas — the
-# only places the walk may descend. Everything else is a leaf value, including `required` (names)
-# and `enum` (values), which must be copied through untouched.
-_SCHEMA_VALUED_KEYWORDS = frozenset({'items', 'additionalProperties'})
-_SCHEMA_LIST_KEYWORDS = frozenset({'anyOf'})
-_SCHEMA_MAP_KEYWORDS = frozenset({'properties'})
-
-
-def _flatten_all_of(json_schema: dict[str, Any]) -> dict[str, Any]:
-    """Best-effort merge of an `allOf` intersection, which `Schema` has no field for.
-
-    `properties` are merged and `required` unioned across the members and the parent's own keys;
-    for anything else the parent wins, then later members. Imperfect for genuinely conflicting
-    constraints, but the alternative — the keyword filter below dropping `allOf` outright — erases
-    the parameter's entire shape into an unconstrained `{}`, which loses far more. Boolean members
-    are skipped: `True` adds no constraint, and `False` (nothing validates) is inexpressible.
-    """
-    members = json_schema.get('allOf')
-    if not isinstance(members, list):
-        return json_schema
-    merged: dict[str, Any] = {}
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    parent = {key: value for key, value in json_schema.items() if key != 'allOf'}
-    candidates: list[dict[str, Any]] = [
-        *(cast('dict[str, Any]', member) for member in cast('list[Any]', members) if isinstance(member, dict)),
-        parent,
-    ]
-    for member in candidates:
-        member = _flatten_all_of(member)
-        for key, value in member.items():
-            if key == 'properties' and isinstance(value, dict):
-                properties.update(cast('dict[str, Any]', value))
-            elif key == 'required' and isinstance(value, list):
-                required.extend(name for name in cast('list[str]', value) if name not in required)
-            else:
-                merged[key] = value
-    if properties:
-        merged['properties'] = properties
-    if required:
-        merged['required'] = required
-    return merged
-
-
-def _drop_unsupported_keywords(json_schema: dict[str, Any]) -> dict[str, Any]:
-    """Drop the keywords Gemini's `Schema` has no field for, recursively."""
-    json_schema = _flatten_all_of(json_schema)
-    kept: dict[str, Any] = {}
-    for key, value in json_schema.items():
-        if key not in _SCHEMA_KEYWORDS:
-            continue
-        if key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
-            # A property's schema can be a boolean too: `True` accepts anything, so it becomes the
-            # unconstrained schema, and `False` accepts nothing, so the property is dropped rather
-            # than declared as something no value could satisfy.
-            kept[key] = {
-                name: {} if schema is True else _drop_unsupported_keywords(schema)
-                for name, schema in cast('dict[str, dict[str, Any] | bool]', value).items()
-                if schema is not False
-            }
-        elif key in _SCHEMA_LIST_KEYWORDS and isinstance(value, list):
-            # A member can be a boolean schema, which `Schema` has no way to express: `True` accepts
-            # anything, so it becomes the unconstrained schema, and `False` accepts nothing, so it
-            # contributes no alternative to the union at all.
-            kept[key] = [
-                {} if item is True else _drop_unsupported_keywords(item)
-                for item in cast('list[dict[str, Any] | bool]', value)
-                if item is not False
-            ]
-        elif key in _SCHEMA_VALUED_KEYWORDS and isinstance(value, dict):
-            kept[key] = _drop_unsupported_keywords(cast('dict[str, Any]', value))
-        else:
-            kept[key] = value
-    return kept
-
-
 def _schema_from_json_schema(json_schema: dict[str, Any]) -> genai_types.Schema:
     """Convert a JSON schema to the `Schema` a Gemini Live function declaration carries.
 
@@ -561,7 +490,10 @@ def _schema_from_json_schema(json_schema: dict[str, Any]) -> genai_types.Schema:
     advertised as non-nullable.
     """
     transformed = GoogleOpenAPISchemaTransformer(json_schema, strict=None).walk()
-    return genai_types.Schema.model_validate(_drop_unsupported_keywords(transformed))
+    accepted_keywords = frozenset(field.alias or name for name, field in genai_types.Schema.model_fields.items())
+    return genai_types.Schema.model_validate(
+        _drop_unsupported_schema_keywords(transformed, accepted_keywords=accepted_keywords)
+    )
 
 
 def _tool_def_to_genai(tool: ToolDefinition, *, async_tool_calls: bool = False) -> genai_types.FunctionDeclaration:
@@ -578,16 +510,9 @@ def _tool_def_to_genai(tool: ToolDefinition, *, async_tool_calls: bool = False) 
 def _native_tool_to_genai(tool: AbstractNativeTool) -> genai_types.Tool:
     """Map a supported Gemini built-in native tool to a genai `Tool`.
 
-    [`WebSearchTool`][pydantic_ai.native_tools.WebSearchTool] maps to Grounding with Google Search,
-    [`WebFetchTool`][pydantic_ai.native_tools.WebFetchTool] to URL context, and
-    [`CodeExecutionTool`][pydantic_ai.native_tools.CodeExecutionTool] to Gemini's code execution tool.
-    [`Agent.realtime`][pydantic_ai.agent.Agent.realtime] validates native tools against
-    the model's [`supported_native_tools`][pydantic_ai.realtime.RealtimeModelProfile.supported_native_tools]
-    profile before connecting, so only these three reach this mapping.
-
-    Note: some Gemini native-audio Live models reject certain built-in tools at connect time. That's a
-    request-time concern surfaced by the API; capturing whatever code-execution parts the model emits
-    (see `_map_server_content`) is always safe and needs no tool to have been requested.
+    Today's Live profile enables Google Search only. URL context and code execution remain class-level
+    capabilities so a future model profile can enable them through the standard capability/profile
+    intersection without another adapter change.
     """
     if isinstance(tool, WebSearchTool):
         return genai_types.Tool(google_search=genai_types.GoogleSearch())
@@ -661,13 +586,8 @@ def _single_ws_user_agent(client: Client) -> Generator[None]:
     capitalized variant just for the connect and restore it after, so a single user-agent reaches the
     socket while HTTP requests keep pydantic-ai's user-agent.
     """
-    # Reach into the SDK's private HTTP options; guarded with `getattr` so custom / fake clients that
-    # don't expose them (e.g. in tests) simply skip the reconciliation.
-    raw_headers = getattr(getattr(getattr(client, '_api_client', None), '_http_options', None), 'headers', None)
-    if not isinstance(raw_headers, dict):
-        yield
-        return
-    headers = cast('dict[str, str]', raw_headers)
+    headers = client._api_client._http_options.headers  # pyright: ignore[reportPrivateUsage]
+    assert headers is not None
     duplicates = [key for key in headers if key.lower() == 'user-agent']
     if len(duplicates) < 2:
         yield
@@ -688,14 +608,10 @@ def _ws_trace_context(client: Client) -> Generator[None]:
     `google-genai` forwards the client's HTTP headers as the Live WebSocket's `additional_headers`, so
     injecting `traceparent` here propagates trace context to the server (e.g. a gateway) over the
     handshake — see `inject_trace_context` for the rationale. The keys it added are removed afterwards
-    so the shared client's later HTTP requests don't carry a stale trace context. Guarded like
-    `_single_ws_user_agent`: custom/fake clients without the private HTTP options simply skip injection.
+    so the shared client's later HTTP requests don't carry a stale trace context.
     """
-    raw_headers = getattr(getattr(getattr(client, '_api_client', None), '_http_options', None), 'headers', None)
-    if not isinstance(raw_headers, dict):
-        yield
-        return
-    headers = cast('dict[str, str]', raw_headers)
+    headers = client._api_client._http_options.headers  # pyright: ignore[reportPrivateUsage]
+    assert headers is not None
     carrier: dict[str, str] = {}
     inject_trace_context(carrier)
     # Compared case-insensitively: header names are, and `websockets` stores them that way, so adding a
@@ -709,44 +625,6 @@ def _ws_trace_context(client: Client) -> Generator[None]:
     finally:
         for key in added:
             headers.pop(key, None)
-
-
-# Matches the native Vertex Bidi WebSocket path the `google-genai` SDK dials (both API versions).
-_VERTEX_BIDI_PATH_RE = re.compile(r'/ws/google\.cloud\.aiplatform\.v1(?:beta1)?\.LlmBidiService/BidiGenerateContent')
-
-
-@contextmanager
-def _ws_gateway_url_rewrite(model: str, base_url: str) -> Generator[None]:
-    """TEMPORARY: rewrite the Gemini Live handshake URL to the gateway's unified realtime path.
-
-    The `google-genai` SDK dials Vertex's native Bidi path
-    (`/proxy/<route>/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`), but the
-    Pydantic AI Gateway's realtime relay currently only routes the OpenAI-shaped
-    `/proxy/<route>/v1/realtime?model=<model>` upgrade path, so a `gateway/google` session otherwise fails
-    the WebSocket upgrade with a 503. Until the gateway accepts the native Bidi path, rewrite the dialed
-    URI so a gateway session connects; the gateway relays the SDK's `setup` frame to the Vertex Bidi
-    upstream verbatim. Remove this once the gateway routes the Bidi path.
-    """
-    from google.genai import live
-
-    real_ws_connect = live.ws_connect  # pyright: ignore[reportPrivateImportUsage]
-    # `live.ws_connect` is a module global, so unrelated `google-genai` Live connections opened
-    # elsewhere in the process during this handshake also enter the wrapper below. Rewrite only URIs
-    # under *this* session's gateway route, so a concurrent connection dialing Vertex directly (or a
-    # different gateway route) passes through to its own endpoint untouched.
-    gateway_prefix = re.sub(r'^http', 'ws', base_url.rstrip('/'))
-
-    def rewritten(uri: str, *args: Any, **kwargs: Any) -> Any:
-        if uri.startswith(gateway_prefix) and _VERTEX_BIDI_PATH_RE.search(uri):
-            base = _VERTEX_BIDI_PATH_RE.sub('/v1/realtime', uri.partition('?')[0], count=1)
-            uri = f'{base}?model={quote(model)}'
-        return real_ws_connect(uri, *args, **kwargs)
-
-    live.ws_connect = rewritten  # pyright: ignore[reportPrivateImportUsage]
-    try:
-        yield
-    finally:
-        live.ws_connect = real_ws_connect  # pyright: ignore[reportPrivateImportUsage]
 
 
 @dataclass(init=False)
@@ -776,39 +654,31 @@ class GoogleRealtimeModel(RealtimeModel):
             returning the one to use. Mirrors `profile=` on a standard
             [`Model`][pydantic_ai.models.Model], and is the escape hatch when a model name doesn't
             identify the model (e.g. an Azure deployment named something other than its model).
-        reconnect: Backoff policy for transparently re-dialing a dropped session; requires
-            `google_enable_session_resumption=True`. With no policy, the low-level connection reports
-            a non-recoverable session error; `RealtimeSession` raises
-            [`RealtimeError`][pydantic_ai.realtime.RealtimeError] from iteration.
     """
 
-    model: str = 'gemini-2.5-flash-native-audio-latest'
+    model: GoogleRealtimeModelName
     _: KW_ONLY
     settings: RealtimeModelSettings | None = None
-    reconnect: ReconnectPolicy | None = None
     _provider: Provider[Client] = field(init=False, repr=False)
-    _gateway: bool = field(init=False, default=False, repr=False)
 
     # Written out rather than generated because `profile` has to be an init argument while
     # `RealtimeModel.profile` stays the *resolved* profile, exactly as on a standard `Model` — a
     # dataclass field of that name would shadow the property.
     def __init__(
         self,
-        model: str = 'gemini-2.5-flash-native-audio-latest',
+        model: GoogleRealtimeModelName,
         *,
-        provider: Provider[Client] | str = 'google',
+        provider: Literal['google', 'google-cloud', 'gateway'] | Provider[Client] = 'google',
         settings: RealtimeModelSettings | None = None,
         profile: RealtimeModelProfileSpec | None = None,
-        reconnect: ReconnectPolicy | None = None,
     ) -> None:
         self.model = model
         self.settings = settings
-        self.reconnect = reconnect
         self._profile = profile
         if isinstance(provider, str):
-            provider = cast('Provider[Client]', infer_provider(provider))
+            provider_name = 'gateway/google-cloud' if provider == 'gateway' else provider
+            provider = cast('Provider[Client]', infer_provider(provider_name))
         self._provider = provider
-        self._gateway = is_gateway_provider(provider)
 
     @property
     def client(self) -> Client:
@@ -816,7 +686,7 @@ class GoogleRealtimeModel(RealtimeModel):
         return self._provider.client
 
     @property
-    def model_name(self) -> str:
+    def model_name(self) -> GoogleRealtimeModelName:
         return self.model
 
     @property
@@ -846,7 +716,7 @@ class GoogleRealtimeModel(RealtimeModel):
                             prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=voice)
                         ),
                     )
-                    for speaker, voice in multi_speaker.voices.items()
+                    for speaker, voice in multi_speaker.get('voices', {}).items()
                 ]
             )
         elif voice:
@@ -890,25 +760,36 @@ class GoogleRealtimeModel(RealtimeModel):
             return False
         return True
 
+    def _session_resumption_enabled(self, settings: GoogleRealtimeModelSettings) -> bool:
+        """Whether to request session-resumption handles.
+
+        An explicit `google_enable_session_resumption` wins; when absent, a `reconnect` policy implies
+        resumption, since a re-dial without a handle would lose the conversation.
+        """
+        if (enabled := settings.get('google_enable_session_resumption')) is not None:
+            return enabled
+        return settings.get('reconnect') is not None
+
     def _realtime_input_config(
         self, model_settings: GoogleRealtimeModelSettings
     ) -> genai_types.RealtimeInputConfig | None:
         """Build the turn-taking config from `vad`, `activity_handling`, and `turn_coverage`."""
         detection: genai_types.AutomaticActivityDetection | None = None
+        vad: AutomaticVAD | None
         if 'google_vad' in model_settings:
             vad = model_settings['google_vad']
         elif 'turn_detection' in model_settings:
             turn_detection = model_settings['turn_detection']
             # `True` means the provider default (on), same as an absent setting. `False` asks for the
-            # same thing as `google_vad=AutomaticVAD(disabled=True)`, so both land on the check below.
+            # same thing as `google_vad={'disabled': True}`, so both land on the check below.
             if turn_detection is False:
-                vad = AutomaticVAD(disabled=True)
+                vad = {'disabled': True}
             else:
                 vad = None if turn_detection is True else _automatic_vad_from_turn_detection(turn_detection)
         else:
             vad = None
         if vad is not None:
-            if vad.disabled:
+            if vad.get('disabled', False):
                 # Disabling VAD is push-to-talk, which needs manual turn control Gemini Live doesn't
                 # expose through this session API yet (no `commit_audio()`/`create_response()`), so a
                 # disabled session would connect but never take a turn. Fail loudly instead.
@@ -918,12 +799,14 @@ class GoogleRealtimeModel(RealtimeModel):
                     'automatic turn detection (the default) instead.'
                 )
             detection = genai_types.AutomaticActivityDetection(
-                start_of_speech_sensitivity=_START_SENSITIVITY[vad.start_sensitivity]
-                if vad.start_sensitivity
+                start_of_speech_sensitivity=_START_SENSITIVITY[start_sensitivity]
+                if (start_sensitivity := vad.get('start_sensitivity'))
                 else None,
-                end_of_speech_sensitivity=_END_SENSITIVITY[vad.end_sensitivity] if vad.end_sensitivity else None,
-                prefix_padding_ms=vad.prefix_padding_ms,
-                silence_duration_ms=vad.silence_duration_ms,
+                end_of_speech_sensitivity=_END_SENSITIVITY[end_sensitivity]
+                if (end_sensitivity := vad.get('end_sensitivity'))
+                else None,
+                prefix_padding_ms=vad.get('prefix_padding_ms'),
+                silence_duration_ms=vad.get('silence_duration_ms'),
             )
         activity_handling = model_settings.get('google_activity_handling')
         turn_coverage = model_settings.get('google_turn_coverage')
@@ -964,8 +847,8 @@ class GoogleRealtimeModel(RealtimeModel):
         self,
         instructions: str,
         tools: list[ToolDefinition] | None,
-        model_settings: GoogleRealtimeModelSettings | None,
         *,
+        model_settings: GoogleRealtimeModelSettings | None,
         native_tools: list[AbstractNativeTool] | None = None,
         resumption_handle: str | None = None,
     ) -> genai_types.LiveConnectConfig:
@@ -995,10 +878,10 @@ class GoogleRealtimeModel(RealtimeModel):
             config.proactivity = genai_types.ProactivityConfig(proactive_audio=True)
         if (context_compression := settings.get('google_context_compression')) is not None:
             config.context_window_compression = genai_types.ContextWindowCompressionConfig(
-                trigger_tokens=context_compression.trigger_tokens,
-                sliding_window=genai_types.SlidingWindow(target_tokens=context_compression.target_tokens),
+                trigger_tokens=context_compression.get('trigger_tokens'),
+                sliding_window=genai_types.SlidingWindow(target_tokens=context_compression.get('target_tokens')),
             )
-        if settings.get('google_enable_session_resumption', False):
+        if self._session_resumption_enabled(settings):
             config.session_resumption = genai_types.SessionResumptionConfig(handle=resumption_handle)
         # Typed as `list[Any]` because `LiveConnectConfig.tools` is a broad union (Tool | Callable |
         # MCP types); a precisely-typed `list[Tool]` isn't assignable to it (list invariance).
@@ -1035,9 +918,18 @@ class GoogleRealtimeModel(RealtimeModel):
         client = self._provider.client
         settings = cast('GoogleRealtimeModelSettings', self._merge_model_settings(model_settings) or {})
         instructions = get_instructions(messages, model_request_parameters) or ''
-        # Transparent reconnect needs both a backoff policy and session resumption (so the server
-        # restores state on re-dial). Without resumption a re-dial would lose the conversation.
-        reconnectable = self.reconnect is not None and settings.get('google_enable_session_resumption', False)
+        # Transparent reconnect needs session resumption, so the server restores state on re-dial;
+        # a `reconnect` policy requests it automatically (see `_session_resumption_enabled`). An
+        # explicit opt-out alongside a policy would silently reconnect into a model that remembers
+        # nothing, so it fails loudly instead.
+        reconnect = settings.get('reconnect')
+        if reconnect is not None and settings.get('google_enable_session_resumption') is False:
+            raise UserError(
+                'A `reconnect` policy requires Gemini session resumption, but '
+                '`google_enable_session_resumption=False` explicitly disables it. Remove the '
+                '`reconnect` policy, or leave `google_enable_session_resumption` unset so the '
+                'policy enables resumption.'
+            )
         # The live connection's context manager. A reconnect closes the previous one before opening
         # the next (so they don't accumulate), and teardown closes whatever is current.
         cm: AbstractAsyncContextManager[AsyncSession] | None = None
@@ -1050,7 +942,7 @@ class GoogleRealtimeModel(RealtimeModel):
             config = self._config(
                 instructions,
                 model_request_parameters.function_tools,
-                settings,
+                model_settings=settings,
                 native_tools=model_request_parameters.native_tools,
                 resumption_handle=handle,
             )
@@ -1059,13 +951,9 @@ class GoogleRealtimeModel(RealtimeModel):
                 with ExitStack() as stack:
                     stack.enter_context(_single_ws_user_agent(client))
                     stack.enter_context(_ws_trace_context(client))
-                    if self._gateway:
-                        # TEMPORARY: reshape the dialed URL to the gateway's unified realtime path until
-                        # the gateway routes the native Vertex Bidi path (see `_ws_gateway_url_rewrite`).
-                        # The gateway bearer auth reaches the handshake via a static header set on the
-                        # client at build time (see `_set_google_ws_gateway_auth`), so no per-connect
-                        # header injection is needed here.
-                        stack.enter_context(_ws_gateway_url_rewrite(self.model, self._provider.base_url))
+                    # A gateway route needs nothing extra here: the relay routes the SDK's native
+                    # Vertex Bidi path, and the gateway bearer auth reaches the handshake via a
+                    # static header set on the client at build time (see `_set_google_ws_gateway_auth`).
                     session = await opening.__aenter__()
             cm = opening
             return session
@@ -1113,8 +1001,8 @@ class GoogleRealtimeModel(RealtimeModel):
                 profile=self.profile,
                 provider_name=self._provider.name,
                 provider_url=self._provider.base_url,
-                dial=dial if reconnectable else None,
-                reconnect=self.reconnect if reconnectable else None,
+                dial=dial if reconnect is not None else None,
+                reconnect=reconnect,
                 input_transcription_enabled=self._input_transcription(settings),
                 async_tool_calls=self._async_tool_calls(settings),
             )
@@ -1184,27 +1072,38 @@ class GoogleRealtimeConnection(RealtimeConnection):
     async def send(self, content: RealtimeInput) -> None:
         """Send content to the Gemini Live API.
 
-        Accepts `AudioInput` (PCM16, 16kHz, mono), `TextInput`, `ImageInput` (a live video frame),
-        and `ToolResult`. The manual turn-taking verbs are not supported (Gemini uses automatic VAD).
+        Accepts `BinaryAudio` (raw PCM16, 16kHz, mono), a `str` text turn, `BinaryImage` (a live
+        video frame), and `ToolResult`. The manual turn-taking verbs are not supported (Gemini uses
+        automatic VAD).
         """
         # `send_realtime_input` is typed against a PIL.Image union the SDK leaves partially untyped.
-        if isinstance(content, AudioInput):
+        if isinstance(content, BinaryAudio):
+            require_pcm_audio(content, provider_name=self._provider_name)
             await self._session.send_realtime_input(  # pyright: ignore[reportUnknownMemberType]
                 audio=genai_types.Blob(data=content.data, mime_type=f'audio/pcm;rate={INPUT_SAMPLE_RATE}')
             )
-        elif isinstance(content, TextInput):
+        elif isinstance(content, str):
             # A typed message is a discrete turn: commit it with `send_client_content(turn_complete=True)`
             # so the model replies, rather than buffering it as streaming realtime input.
             await self._session.send_client_content(
-                turns=genai_types.Content(role='user', parts=[genai_types.Part(text=content.text)]),
+                turns=genai_types.Content(role='user', parts=[genai_types.Part(text=content)]),
                 turn_complete=True,
             )
-        elif isinstance(content, ImageInput):
+        elif isinstance(content, BinaryImage):
             await self._session.send_realtime_input(  # pyright: ignore[reportUnknownMemberType]
                 video=genai_types.Blob(data=content.data, mime_type=content.media_type)
             )
         elif isinstance(content, ToolResult):
             name, gemini_id = self._tool_calls.pop(content.tool_call_id, ('', None))
+            # `FunctionResponse.response` is JSON-only, so text attachments are folded into the
+            # output and binary attachments raise — loudly, with the tool result unsent, never a
+            # silent placeholder. Every live delivery channel was probed and fails: content in a
+            # `send_client_content(turn_complete=False)` turn or a `send_realtime_input` frame is
+            # invisible to the generation `send_tool_response` triggers (the model guesses), a
+            # `turn_complete=True` turn is seen but first triggers a spurious extra spoken response,
+            # and `FunctionResponse.parts` — the true analog of the classic Gemini 3 multimodal
+            # function-response path — doesn't serialize in the SDK's live path yet. Tracked in
+            # https://github.com/pydantic/pydantic-ai/issues/7362.
             output = content.output
             if content.content:
                 text_content: list[str] = []
@@ -1216,7 +1115,12 @@ class GoogleRealtimeConnection(RealtimeConnection):
                     elif isinstance(item, CachePoint):
                         continue
                     elif isinstance(item, (ImageUrl, AudioUrl, DocumentUrl, VideoUrl, BinaryContent, UploadedFile)):
-                        text_content.append(f'[{type(item).__name__}: {item.identifier}]')
+                        raise UserError(
+                            f'{self._provider_label} tool results are JSON-only, so `{type(item).__name__}` '
+                            'content attached to a tool return cannot be delivered. Return text instead, or '
+                            'use a realtime provider that supports tool-result media. '
+                            'See https://github.com/pydantic/pydantic-ai/issues/7362.'
+                        )
                     else:
                         assert_never(item)
                 output = '\n\n'.join(part for part in (output, *text_content) if part)
@@ -1391,7 +1295,7 @@ class GoogleRealtimeConnection(RealtimeConnection):
                 # A tool call opens the turn like audio output does: the session holds a partial
                 # response for it, so a drop before `turn_complete` needs the same synthetic boundary.
                 self._turn_open = True
-                events.append(ToolCall(tool_call_id=call_id, tool_name=name, args=json.dumps(call.args or {})))
+                events.append(ToolCall(tool_call_id=call_id, tool_name=name, args=to_json(call.args or {}).decode()))
         if message.tool_call_cancellation is not None and (cancelled_ids := message.tool_call_cancellation.ids):
             # The cancellation carries Gemini's own call ids, which match the `tool_call_id`s emitted
             # above whenever Gemini assigned them (id-less calls can't be cancelled by id anyway).
@@ -1402,7 +1306,7 @@ class GoogleRealtimeConnection(RealtimeConnection):
             events.append(ToolCallCancelled(tool_call_ids=list(cancelled_ids)))
         if message.usage_metadata is not None:
             events.append(
-                SessionUsageEvent(
+                SessionUsage(
                     usage=_map_usage(
                         message.usage_metadata,
                         provider_name=self._provider_name,

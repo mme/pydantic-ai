@@ -15,17 +15,25 @@ by both [`OpenAIRealtimeModel`][pydantic_ai.realtime.openai.OpenAIRealtimeModel]
 
 from __future__ import annotations as _annotations
 
-import json
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
-from .._utils import is_str_dict
+from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
+from pydantic_core import to_json
+
 from ..exceptions import ModelHTTPError, UnexpectedModelBehavior
-from ._base import RealtimeClientSecret, WebRTCAnswer, WebRTCSession
+from .model import RealtimeClientSecret, WebRTCAnswer, WebRTCSession
 
 if TYPE_CHECKING:
     import httpx
+
+
+class _ClientSecretResponse(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
+    value: str
+    expires_at: StrictInt
 
 
 def parse_call_id(location: str | None) -> str | None:
@@ -75,19 +83,19 @@ async def mint_client_secret(
     response = await http_client.post(
         client_secrets_url,
         headers={**headers, 'Content-Type': 'application/json'},
-        content=json.dumps(payload),
+        content=to_json(payload).decode(),
     )
     _raise_for_status(response, provider_name)
-    data = response.json()
-    if not is_str_dict(data) or not isinstance(value := data.get('value'), str):
-        raise UnexpectedModelBehavior('Realtime client-secret response did not include a `value`.')
-    expires_at = data.get('expires_at')
-    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
-        raise UnexpectedModelBehavior('Realtime client-secret response did not include a numeric `expires_at`.')
-    provider_details = {key: item for key, item in data.items() if key != 'value'}
+    try:
+        data = _ClientSecretResponse.model_validate_json(response.content)
+    except ValidationError as e:
+        if any(error['loc'] == ('value',) for error in e.errors()):
+            raise UnexpectedModelBehavior('Realtime client-secret response did not include a `value`.') from e
+        raise UnexpectedModelBehavior('Realtime client-secret response did not include a numeric `expires_at`.') from e
+    provider_details = data.model_dump(exclude={'value'})
     return RealtimeClientSecret(
-        value=value,
-        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc),
+        value=data.value,
+        expires_at=datetime.fromtimestamp(data.expires_at, tz=timezone.utc),
         provider_details=provider_details or None,
     )
 
@@ -137,7 +145,7 @@ async def answer_webrtc_offer(
         headers={**headers, 'Accept': 'application/sdp'},
         files=[
             ('sdp', (None, sdp_offer, 'application/sdp')),
-            ('session', (None, json.dumps(session_config), 'application/json')),
+            ('session', (None, to_json(session_config).decode(), 'application/json')),
         ],
     )
     return _webrtc_answer_from_response(response, provider_name)

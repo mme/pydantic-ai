@@ -6,33 +6,27 @@ protocol to the shared realtime event types.
 Requires the `websockets` and `openai` packages, available via the `realtime` and `openai` optional
 groups:
 
-    pip install "pydantic-ai-slim[realtime,openai]"
+    pip install "pydantic-ai-slim[openai-realtime]"
 """
 
 from __future__ import annotations as _annotations
 
 import base64
-import json
-import math
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import KW_ONLY, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from urllib.parse import quote
 
+from pydantic import BaseModel, FiniteFloat, TypeAdapter
+from pydantic_core import to_json
 from typing_extensions import TypeAliasType
 
 try:
     import websockets
     from openai.types.realtime import (
-        ConversationItemInputAudioTranscriptionCompletedEvent,
         RealtimeResponseUsage,
-        RealtimeResponseUsageInputTokenDetails,
-        RealtimeResponseUsageOutputTokenDetails,
         RealtimeSessionCreateRequest,
-        ResponseAudioDeltaEvent,
-        ResponseCreatedEvent,
-        ResponseDoneEvent,
         SessionCreatedEvent,
     )
     from openai.types.realtime.conversation_item_input_audio_transcription_completed_event import (
@@ -41,73 +35,61 @@ try:
         UsageTranscriptTextUsageTokensInputTokenDetails,
     )
     from openai.types.realtime.realtime_audio_config_output import VoiceID
-    from openai.types.realtime.realtime_response_usage_input_token_details import CachedTokensDetails
     from websockets.asyncio.client import ClientConnection
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'Please install the `websockets` package to use the OpenAI Realtime model, '
-        'you can use the `realtime` and `openai` optional groups - `pip install "pydantic-ai-slim[realtime,openai]"`'
+        'you can use the `openai-realtime` optional group - `pip install "pydantic-ai-slim[openai-realtime]"`'
     ) from _import_error
 
 if TYPE_CHECKING:
+    import httpx
+
     # Only needed for typing: the provider supplies the concrete client at runtime, so importing the
     # protocol helpers below (e.g. from the xAI realtime provider) doesn't require the `openai` package.
-    import httpx
     from openai import AsyncOpenAI
     from openai.types.realtime.realtime_truncation_param import RealtimeTruncationParam
 
 from .._instrumentation import get_instructions
-from .._utils import is_str_dict
 from ..exceptions import UserError
-from ..messages import ModelMessage
+from ..messages import (
+    BinaryAudio,
+    BinaryImage,
+    ModelMessage,
+    RealtimeOutputSpeechEndEvent,
+    RealtimeOutputSpeechStartEvent,
+    RealtimeSessionErrorEvent,
+    RealtimeSessionReconnectEvent,
+)
 from ..models import ModelRequestParameters
 from ..profiles.openai import OPENAI_REASONING_EFFORT_MAP
 from ..providers import Provider, infer_provider
 from ..tools import ToolDefinition
 from ..usage import RequestUsage
-from ._base import (
-    AudioDelta,
-    AudioInput,
-    CancelResponse,
-    ClearAudio,
-    CommitAudio,
-    CreateResponse,
-    ImageInput,
-    InputTranscript,
-    RealtimeClientSecret,
-    RealtimeCodecEvent,
-    RealtimeConnection,
-    RealtimeInput,
-    RealtimeModel,
-    RealtimeModelProfileSpec,
-    RealtimeModelSettings,
-    RealtimeOutputSpeechEndEvent,
-    RealtimeOutputSpeechStartEvent,
-    RealtimeProviderSession,
-    RealtimeSessionErrorEvent,
-    RealtimeSessionReconnectEvent,
-    ReconnectPolicy,
-    SessionUsageEvent,
-    TextInput,
-    ToolResult,
-    TruncateOutput,
-    WebRTCAnswer,
-    inject_trace_context,
-    reconnect_with_backoff,
-    resolve_advertised_tools,
-)
 from ._openai_protocol import (
     AUDIO_DELTA_TYPES,
+    CONVERSATION_ITEM_CREATE_EVENT,
+    CONVERSATION_ITEM_TRUNCATE_EVENT,
+    INPUT_AUDIO_BUFFER_APPEND_EVENT,
+    INPUT_AUDIO_BUFFER_CLEAR_EVENT,
+    INPUT_AUDIO_BUFFER_COMMIT_EVENT,
     INPUT_TRANSCRIPT_DONE_TYPES,
+    RESPONSE_CANCEL_EVENT,
+    RESPONSE_CREATE_EVENT,
+    RESPONSE_CREATED_EVENT_ADAPTER,
+    RESPONSE_DONE_EVENT_ADAPTER,
+    SESSION_UPDATE_EVENT,
+    SESSION_UPDATED_EVENT,
+    ProtocolResponseDoneEvent,
     RealtimeHandshakeError,
     SemanticVAD,
     ServerVAD,
+    connect_openai_protocol,
     expect_event,
     loads_obj,
     map_connect_errors,
     map_event,
     realtime_websocket_url,
-    replay_items,
     resolve_base_turn_detection,
     resolve_transcription_model,
     response_finish_reason,
@@ -116,10 +98,27 @@ from ._openai_protocol import (
     tool_def_to_openai,
     turn_detection_config,
     user_message_item,
-    validate_response_data,
     with_realtime_query,
 )
 from ._openai_webrtc import answer_webrtc_offer as _answer_webrtc_offer, mint_client_secret as _mint_client_secret
+from ._utils import inject_trace_context, reconnect_with_backoff, require_pcm_audio, resolve_advertised_tools
+from .codec import (
+    AudioDelta,
+    CancelResponse,
+    ClearAudio,
+    CommitAudio,
+    CreateResponse,
+    InputTranscript,
+    RealtimeCodecEvent,
+    RealtimeConnection,
+    RealtimeInput,
+    SessionUsage,
+    ToolResult,
+    TruncateOutput,
+)
+from .model import RealtimeClientSecret, RealtimeModel, RealtimeProviderSession, WebRTCAnswer
+from .profiles import RealtimeModelProfileSpec
+from .settings import RealtimeModelSettings, ReconnectPolicy
 
 # `input_transcription_model='auto'` resolves to this — OpenAI's recommended realtime transcription model
 # ("For the lowest-latency streaming transcription path, use gpt-realtime-whisper"; it's natively streaming
@@ -127,11 +126,39 @@ from ._openai_webrtc import answer_webrtc_offer as _answer_webrtc_offer, mint_cl
 # (see `resolve_transcription_model`) so it can be bumped without changing the behavior of apps on `'auto'`.
 _AUTO_TRANSCRIPTION_MODEL = 'gpt-realtime-whisper'
 
-# WebRTC-only playback boundaries: over a WebRTC call the audio reaches the browser on the media track
-# rather than as deltas, so these frames are the sideband's only signal of whether the model is still
-# being heard. `stopped` ends playback naturally; `cleared` acknowledges an `output_audio_buffer.clear`.
+_OUTPUT_AUDIO_BUFFER_CLEAR_EVENT = 'output_audio_buffer.clear'
 _OUTPUT_SPEECH_START_FRAME = 'output_audio_buffer.started'
 _OUTPUT_SPEECH_END_FRAMES = frozenset({'output_audio_buffer.stopped', 'output_audio_buffer.cleared'})
+
+
+class _SidebandContentPart(BaseModel):
+    type: str
+
+
+class _SidebandContentPartAdded(BaseModel):
+    item_id: str
+    content_index: int = 0
+    part: _SidebandContentPart
+
+
+class _SidebandSession(BaseModel):
+    model: str | None = None
+
+
+class _SidebandSessionUpdated(BaseModel):
+    session: _SidebandSession
+
+
+LatestOpenAIRealtimeModelNames = Literal['gpt-realtime', 'gpt-realtime-2.1', 'gpt-realtime-2.1-mini']
+OpenAIRealtimeModelName = str | LatestOpenAIRealtimeModelNames
+
+LatestOpenAIRealtimeTranscriptionModelNames = Literal[
+    'whisper-1',
+    'gpt-4o-transcribe',
+    'gpt-4o-mini-transcribe',
+    'gpt-realtime-whisper',
+]
+OpenAIRealtimeTranscriptionModelName = str | LatestOpenAIRealtimeTranscriptionModelNames
 
 __all__ = (
     'OpenAIRealtimeModel',
@@ -198,43 +225,6 @@ class OpenAIRealtimeModelSettings(RealtimeModelSettings, total=False):
     """
 
 
-def _int(value: Any) -> int:
-    """Return `value` if it is an int (but not a bool), otherwise `0`."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-
-def _validate_usage_shape(usage: object, *, transcription: bool = False) -> None:
-    """Reject malformed nested usage objects before accessing SDK-constructed fields."""
-    if usage is None:
-        return
-    if not is_str_dict(usage):
-        raise ValueError('`usage` must be an object')
-    detail_keys = ('input_token_details',) if transcription else ('input_token_details', 'output_token_details')
-    for key in detail_keys:
-        details = usage.get(key)
-        if details and not is_str_dict(details):
-            raise ValueError(f'`usage.{key}` must be an object')
-    input_details = usage.get('input_token_details')
-    if is_str_dict(input_details):
-        cached_details = input_details.get('cached_tokens_details')
-        if cached_details and not is_str_dict(cached_details):
-            raise ValueError('`usage.input_token_details.cached_tokens_details` must be an object')
-    if transcription:
-        # The transcription-usage union (`tokens` | `duration`) is discriminated by `type`. The SDK's
-        # lenient `construct` can build the wrong variant for a malformed payload (e.g. a `duration` type
-        # with no numeric `seconds`), so validate the raw shape here to keep such frames on the recoverable
-        # path rather than crashing on a later `usage.seconds` read.
-        usage_type = usage.get('type')
-        if usage_type == 'duration':
-            seconds = usage.get('seconds')
-            if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
-                raise ValueError('`usage.seconds` must be a number for a `duration` transcription usage')
-            if not math.isfinite(seconds):
-                raise ValueError('`usage.seconds` must be finite for a `duration` transcription usage')
-        elif usage_type not in ('tokens', None):
-            raise ValueError(f'unknown transcription usage type {usage_type!r}')
-
-
 def _map_usage(usage: RealtimeResponseUsage | None) -> RequestUsage | None:
     """Map a `response.done` `usage` payload to a [`RequestUsage`][pydantic_ai.usage.RequestUsage].
 
@@ -247,15 +237,10 @@ def _map_usage(usage: RealtimeResponseUsage | None) -> RequestUsage | None:
     """
     if usage is None or not usage.model_fields_set:
         return None
+    usage = RealtimeResponseUsage.model_validate(usage.model_dump(warnings=False))
     inp = usage.input_token_details or None
     out = usage.output_token_details or None
-    if inp is not None and not isinstance(inp, RealtimeResponseUsageInputTokenDetails):
-        raise ValueError('`usage.input_token_details` must be an object')
-    if out is not None and not isinstance(out, RealtimeResponseUsageOutputTokenDetails):
-        raise ValueError('`usage.output_token_details` must be an object')
     cached = inp.cached_tokens_details if inp is not None else None
-    if cached is not None and not isinstance(cached, CachedTokensDetails):
-        raise ValueError('`usage.input_token_details.cached_tokens_details` must be an object')
     # `reasoning_tokens` is on the wire but isn't a field of the SDK model, so it arrives as an extra.
     # The standard adapter names the same concept `reasoning_tokens` in `details` and also sets the
     # typed `output_reasoning_tokens`; realtime set neither, so a reasoning turn reported none at all.
@@ -275,12 +260,12 @@ def _map_usage(usage: RealtimeResponseUsage | None) -> RequestUsage | None:
         if isinstance(raw, int) and not isinstance(raw, bool):
             details[key] = raw
     return RequestUsage(
-        input_tokens=_int(usage.input_tokens),
-        output_tokens=_int(usage.output_tokens),
-        input_audio_tokens=_int(inp.audio_tokens if inp is not None else None),
-        cache_read_tokens=_int(inp.cached_tokens if inp is not None else None),
-        cache_audio_read_tokens=_int(cached.audio_tokens if cached is not None else None),
-        output_audio_tokens=_int(out.audio_tokens if out is not None else None),
+        input_tokens=usage.input_tokens or 0,
+        output_tokens=usage.output_tokens or 0,
+        input_audio_tokens=inp.audio_tokens or 0 if inp is not None else 0,
+        cache_read_tokens=inp.cached_tokens or 0 if inp is not None else 0,
+        cache_audio_read_tokens=cached.audio_tokens or 0 if cached is not None else 0,
+        output_audio_tokens=out.audio_tokens or 0 if out is not None else 0,
         # Left unset — not zeroed — when the provider doesn't report it, so a model that doesn't reason
         # is distinguishable from one that reasoned for free, exactly as `RequestUsage.extract` leaves it.
         **({'output_reasoning_tokens': details['reasoning_tokens']} if 'reasoning_tokens' in details else {}),
@@ -289,6 +274,26 @@ def _map_usage(usage: RealtimeResponseUsage | None) -> RequestUsage | None:
 
 
 RealtimeTranscriptionUsage = UsageTranscriptTextUsageTokens | UsageTranscriptTextUsageDuration
+
+
+class _RealtimeTranscriptionTokenUsage(UsageTranscriptTextUsageTokens):
+    """Token usage shape accepted by Azure/xAI, which omit OpenAI's required token fields."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    type: Literal['tokens'] = 'tokens'
+
+
+RealtimeTranscriptionWireUsage = _RealtimeTranscriptionTokenUsage | UsageTranscriptTextUsageDuration
+_TRANSCRIPTION_USAGE_ADAPTER: TypeAdapter[RealtimeTranscriptionWireUsage] = TypeAdapter(RealtimeTranscriptionWireUsage)
+_FINITE_FLOAT_ADAPTER: TypeAdapter[float] = TypeAdapter(FiniteFloat)
+
+
+def _validate_transcription_usage(usage: object) -> RealtimeTranscriptionUsage | None:
+    if usage is None or usage == {}:
+        return None
+    return _TRANSCRIPTION_USAGE_ADAPTER.validate_python(usage)
 
 
 def _map_transcription_usage(usage: RealtimeTranscriptionUsage | None) -> RequestUsage | None:
@@ -312,11 +317,11 @@ def _map_transcription_usage(usage: RealtimeTranscriptionUsage | None) -> Reques
         ):
             if isinstance(raw, int) and not isinstance(raw, bool):
                 details[key] = raw
-    elif usage.seconds > 0:
+    elif (seconds := _FINITE_FLOAT_ADAPTER.validate_python(usage.seconds)) > 0:
         # `RunUsage.details` values are ints, so a fractional duration has to round. Sub-half-second
         # clips round to zero, which would drop billed transcription entirely — report the floor of
         # one second instead, so a short utterance is visible rather than free.
-        details['input_transcription_seconds'] = max(1, round(usage.seconds))
+        details['input_transcription_seconds'] = max(1, round(seconds))
     return RequestUsage(details=details) if details else None
 
 
@@ -365,9 +370,9 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         self._dial = dial
         self._reconnect = reconnect
         self._restores_state_on_reconnect = False
-        # Set by the session (see `set_conversation`) so a re-dial can replay the call. The API keeps no
+        # Set by the session (see `set_message_history`) so a re-dial can replay the call. The API keeps no
         # state across sessions, so without it a reconnect resumes knowing nothing that was said.
-        self._conversation: Callable[[], Sequence[ModelMessage]] | None = None
+        self._message_history: Callable[[], Sequence[ModelMessage]] | None = None
         self._input_transcription_enabled = input_transcription_enabled
         self._reconnects_used = 0
         self._observes_output_audio = observes_output_audio
@@ -389,18 +394,15 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         self._current_item_id: str | None = None
         self._current_content_index = 0
         self._generated_audio_bytes = 0
-        # Whether the provider is still streaming audio to the browser, tracked from the WebRTC-only
-        # playback-boundary events. A sideband sees no output-audio deltas, so this is its only signal.
         self._output_audio_playing = False
-        # Whether an `output_audio_buffer.clear` is already in flight for the current utterance.
         self._output_speech_clear_sent = False
 
     @property
     def model_name(self) -> str | None:
         return self._model_name_getter() if self._model_name_getter is not None else self._model_name
 
-    def set_conversation(self, conversation: Callable[[], Sequence[ModelMessage]]) -> None:
-        self._conversation = conversation
+    def set_message_history(self, message_history: Callable[[], Sequence[ModelMessage]]) -> None:
+        self._message_history = message_history
         # A reconnect will now replay the call, so it restores state rather than starting blank.
         self._restores_state_on_reconnect = True
 
@@ -409,9 +411,9 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         return _map_usage(usage)
 
     @property
-    def conversation(self) -> Callable[[], Sequence[ModelMessage]] | None:
+    def message_history(self) -> Callable[[], Sequence[ModelMessage]] | None:
         """The call so far, when a session has offered it for replay on reconnect."""
-        return self._conversation
+        return self._message_history
 
     @property
     def input_transcription_enabled(self) -> bool:
@@ -420,25 +422,26 @@ class OpenAIRealtimeConnection(RealtimeConnection):
     async def send(self, content: RealtimeInput) -> None:
         """Send content to the OpenAI Realtime API.
 
-        Accepts `AudioInput` (PCM16, 24kHz, mono), `TextInput`, `ImageInput`, `ToolResult`, and the
-        control verbs `CommitAudio`, `ClearAudio`, `CreateResponse`, `CancelResponse`, and
-        `TruncateOutput`.
+        Accepts `BinaryAudio` (raw PCM16, 24kHz, mono), a `str` text turn, `BinaryImage`,
+        `ToolResult`, and the control verbs `CommitAudio`, `ClearAudio`, `CreateResponse`,
+        `CancelResponse`, and `TruncateOutput`.
         """
-        if isinstance(content, AudioInput):
+        if isinstance(content, BinaryAudio):
+            require_pcm_audio(content, provider_name=self._provider_label)
             await self._send_event(
                 {
-                    'type': 'input_audio_buffer.append',
+                    'type': INPUT_AUDIO_BUFFER_APPEND_EVENT,
                     'audio': base64.b64encode(content.data).decode('ascii'),
                 }
             )
-        elif isinstance(content, TextInput):
+        elif isinstance(content, str):
             await self._send_event(
                 {
-                    'type': 'conversation.item.create',
+                    'type': CONVERSATION_ITEM_CREATE_EVENT,
                     'item': {
                         'type': 'message',
                         'role': 'user',
-                        'content': [{'type': 'input_text', 'text': content.text}],
+                        'content': [{'type': 'input_text', 'text': content}],
                     },
                 }
             )
@@ -458,7 +461,7 @@ class OpenAIRealtimeConnection(RealtimeConnection):
             )
             await self._send_event(
                 {
-                    'type': 'conversation.item.create',
+                    'type': CONVERSATION_ITEM_CREATE_EVENT,
                     'item': {
                         'type': 'function_call_output',
                         'call_id': content.tool_call_id,
@@ -467,15 +470,15 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 }
             )
             if item:
-                await self._send_event({'type': 'conversation.item.create', 'item': item})
+                await self._send_event({'type': CONVERSATION_ITEM_CREATE_EVENT, 'item': item})
             await self._request_response()
-        elif isinstance(content, ImageInput):
+        elif isinstance(content, BinaryImage):
             # An image is added as conversation context (like a video frame), not a turn of its own,
             # so it doesn't trigger a response — drive that with audio (VAD) or `CreateResponse`.
-            data_uri = f'data:{content.media_type};base64,{base64.b64encode(content.data).decode("ascii")}'
+            data_uri = content.data_uri
             await self._send_event(
                 {
-                    'type': 'conversation.item.create',
+                    'type': CONVERSATION_ITEM_CREATE_EVENT,
                     'item': {
                         'type': 'message',
                         'role': 'user',
@@ -484,16 +487,16 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 }
             )
         elif isinstance(content, CommitAudio):
-            await self._send_event({'type': 'input_audio_buffer.commit'})
+            await self._send_event({'type': INPUT_AUDIO_BUFFER_COMMIT_EVENT})
         elif isinstance(content, ClearAudio):
-            await self._send_event({'type': 'input_audio_buffer.clear'})
+            await self._send_event({'type': INPUT_AUDIO_BUFFER_CLEAR_EVENT})
         elif isinstance(content, CreateResponse):
             await self._request_response()
         elif isinstance(content, CancelResponse):
             # Only cancel when a response is actually active: with server VAD the provider may have
             # already cancelled on the user's barge-in, and a redundant cancel raises a session error.
             if self._response_active and not self._cancel_sent:
-                await self._send_event({'type': 'response.cancel'})
+                await self._send_event({'type': RESPONSE_CANCEL_EVENT})
                 self._cancel_sent = True
                 # Suppress the cancelled response's trailing deltas until its `response.done` arrives.
                 self._cancelled_response_id = self._active_response_id
@@ -502,18 +505,8 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 # item (server-initiated cancels clear it via `response.done`, but a client cancel doesn't).
                 self._current_item_id = None
                 self._generated_audio_bytes = 0
-            # Over WebRTC the provider streams audio to the browser far ahead of playback and keeps
-            # playing what it already sent, so `response.cancel` — which only stops generation — leaves
-            # the user listening to speech they interrupted (measured: 27s of it still to come after
-            # `response.done`). Dropping that buffer is what actually ends the turn for the listener,
-            # and it applies even once the response is over, which is why it hangs off playback state
-            # rather than `_response_active`. A WebSocket session has no such buffer (the caller holds
-            # the audio) and the provider rejects the event there, so this is sideband-only.
-            # Playback state stays the provider's to report: clearing it here would swallow the
-            # `cleared` frame's `RealtimeOutputSpeechEndEvent` and leave a "speaking" indicator stuck on
-            # through a barge-in. A separate flag keeps a repeated interrupt from re-sending the clear.
             if not self._observes_output_audio and self._output_audio_playing and not self._output_speech_clear_sent:
-                await self._send_event({'type': 'output_audio_buffer.clear'})
+                await self._send_event({'type': _OUTPUT_AUDIO_BUFFER_CLEAR_EVENT})
                 self._output_speech_clear_sent = True
         elif isinstance(content, TruncateOutput):
             # No current output item (e.g. the model wasn't speaking) → nothing to truncate.
@@ -527,7 +520,7 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                     audio_end_ms = min(audio_end_ms, max_audio_end_ms)
                 await self._send_event(
                     {
-                        'type': 'conversation.item.truncate',
+                        'type': CONVERSATION_ITEM_TRUNCATE_EVENT,
                         'item_id': self._current_item_id,
                         'content_index': self._current_content_index,
                         'audio_end_ms': audio_end_ms,
@@ -543,10 +536,10 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         else:
             self._response_active = True
             self._active_response_id = None
-            await self._send_event({'type': 'response.create'})
+            await self._send_event({'type': RESPONSE_CREATE_EVENT})
 
     async def _send_event(self, event: dict[str, Any]) -> None:
-        await self._ws.send(json.dumps(event))
+        await self._ws.send(to_json(event).decode())
 
     def _map_event(self, data: dict[str, Any]) -> RealtimeCodecEvent | None:
         """Map a raw provider frame to a codec event.
@@ -578,10 +571,6 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 # without one, the consumer learns the conversation was cut off instead of seeing the
                 # stream quietly end.
                 if not self._observes_output_audio:
-                    # Except on a WebRTC sideband, where the browser owns the call: a clean close is it
-                    # hanging up, which is how a call is *supposed* to end. Reporting that as an error
-                    # (or re-dialing into a call whose media path is gone) would be wrong, so the stream
-                    # just ends. An abnormal close still raises below and is handled as a drop.
                     return
                 closed = _describe_close(self._ws)
             except self.transport_errors as e:
@@ -623,38 +612,24 @@ class OpenAIRealtimeConnection(RealtimeConnection):
             self._cancelled_response_id = None
 
     def _track_sideband_audio_part(self, data: dict[str, Any]) -> None:
-        """Track the item/content index carrying a response's audio, from `response.content_part.added`.
+        added = _SidebandContentPartAdded.model_validate(data)
+        if added.part.type == 'audio':
+            self._current_item_id = added.item_id
+            self._current_content_index = added.content_index
 
-        A sideband receives no output-audio deltas, so this is the only place it learns which item and
-        content part carry the response's audio — the target a `TruncateOutput` must name. Without it
-        the truncation is silently dropped and history records the whole turn as heard.
-        """
-        part = data.get('part')
-        if is_str_dict(part) and part.get('type') == 'audio' and isinstance(item_id := data.get('item_id'), str):
-            self._current_item_id = item_id
-            content_index = data.get('content_index')
-            self._current_content_index = content_index if isinstance(content_index, int) else 0
-
-    async def _decode_frame(self, raw: str) -> list[RealtimeCodecEvent]:
+    async def _decode_frame(self, raw: str) -> list[RealtimeCodecEvent]:  # noqa: C901
         """Parse one text frame into events, updating tracked response state.
 
-        Raises `ValueError` (incl. `json.JSONDecodeError` / `binascii.Error`) on a malformed payload.
+        Raises `ValueError` (incl. `pydantic.ValidationError` / `binascii.Error`) on a malformed payload.
         """
         data = loads_obj(raw)
         event_type = data.get('type')
-        # Playback state belongs to the connection, not to any one response, so track it before the
-        # straggler filter: the `cleared`/`stopped` frames of a response we just cancelled carry its
-        # `response_id` and would be dropped, leaving us believing the browser is still being spoken to.
         if event_type == _OUTPUT_SPEECH_START_FRAME:
             self._output_audio_playing = True
-            # Surfaced only on a sideband: an ordinary session owns the audio and already knows when it
-            # starts playing, so reporting the provider's buffer there would be noise.
             return [] if self._observes_output_audio else [RealtimeOutputSpeechStartEvent()]
-        elif event_type in _OUTPUT_SPEECH_END_FRAMES:
+        if event_type in _OUTPUT_SPEECH_END_FRAMES:
             was_playing, self._output_audio_playing = self._output_audio_playing, False
             self._output_speech_clear_sent = False
-            # A `cleared` we asked for still ends playback, so it reports the end like a natural stop;
-            # `was_playing` keeps a second end frame for the same utterance from reporting it twice.
             return [] if self._observes_output_audio or not was_playing else [RealtimeOutputSpeechEndEvent()]
         # Drop trailing frames from a response we cancelled on barge-in (its audio/transcript deltas,
         # output-item events, etc.); its own `response.done` still passes through below to close the
@@ -673,12 +648,9 @@ class OpenAIRealtimeConnection(RealtimeConnection):
             events.extend(done_events)
         event = self._map_event(data)
         if event_type == 'response.created':
-            response_data = data.get('response')
-            if response_data is not None and not is_str_dict(response_data):
-                raise ValueError('`response` must be an object')
-            created = ResponseCreatedEvent.construct(**data)
+            created = RESPONSE_CREATED_EVENT_ADAPTER.validate_python(data)
             self._response_active = True
-            self._active_response_id = created.response.id or None if is_str_dict(response_data) else None
+            self._active_response_id = created.response.id or None
             if self._cancel_sent and self._cancelled_response_id is None:
                 # A cancel raced ahead of this `response.created`: it was sent while the response the
                 # client asked for had no server-assigned id yet, so the suppression id could not be
@@ -688,15 +660,15 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         elif event_type == 'response.content_part.added' and not self._observes_output_audio:
             self._track_sideband_audio_part(data)
         elif event_type in AUDIO_DELTA_TYPES:
-            audio = ResponseAudioDeltaEvent.construct(**data)
             # Track the speaking item so a later `TruncateOutput` can name it.
-            if audio.item_id and isinstance(event, AudioDelta):
-                item_changed = (audio.item_id, audio.content_index or 0) != (
+            if isinstance(event, AudioDelta) and event.item_id:
+                content_index = TypeAdapter(int).validate_python(data.get('content_index', 0))
+                item_changed = (event.item_id, content_index) != (
                     self._current_item_id,
                     self._current_content_index,
                 )
-                self._current_item_id = audio.item_id
-                self._current_content_index = audio.content_index or 0
+                self._current_item_id = event.item_id
+                self._current_content_index = content_index
                 if item_changed:
                     self._generated_audio_bytes = len(event.data)
                 else:
@@ -704,24 +676,17 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         if event is not None and not (event_type == 'response.done' and superseded):
             events.append(event)
             if isinstance(event, InputTranscript) and event.is_final and event_type in INPUT_TRANSCRIPT_DONE_TYPES:
-                events.extend(self._transcription_usage_events(data))
+                # The transcript is already recorded, so a malformed `usage` payload costs the usage
+                # event, not the user's words: report it as the same recoverable frame error `__aiter__`
+                # would have raised rather than discarding the whole frame along with it.
+                try:
+                    usage = _validate_transcription_usage(data.get('usage'))
+                except ValueError as e:
+                    events.append(_frame_error(e))
+                else:
+                    if (asr := _map_transcription_usage(usage)) is not None:
+                        events.append(SessionUsage(usage=asr, response_scoped=False))
         return events
-
-    def _transcription_usage_events(self, data: dict[str, Any]) -> list[RealtimeCodecEvent]:
-        """Usage reported alongside a finalized input transcript, or the frame error it was malformed with.
-
-        The transcript is already recorded by the time this runs, so a malformed `usage` payload costs
-        the usage event, not the user's words: it is reported as the same recoverable frame error
-        `__aiter__` would have raised, rather than discarding the whole frame along with it.
-        """
-        try:
-            _validate_usage_shape(data.get('usage'), transcription=True)
-        except ValueError as e:
-            return [_frame_error(e)]
-        completed = ConversationItemInputAudioTranscriptionCompletedEvent.construct(**data)
-        if (asr := _map_transcription_usage(completed.usage)) is not None:
-            return [SessionUsageEvent(usage=asr, response_scoped=False)]
-        return []
 
     async def _handle_response_done(self, data: dict[str, Any]) -> tuple[list[RealtimeCodecEvent], bool]:
         """Update response state and emit usage for a `response.done`.
@@ -733,13 +698,11 @@ class OpenAIRealtimeConnection(RealtimeConnection):
         """
         events: list[RealtimeCodecEvent] = []
         try:
-            response_data = validate_response_data(data)
+            done = RESPONSE_DONE_EVENT_ADAPTER.validate_python(data)
         except ValueError:
             # A `response` payload of the wrong shape carries no id to reason about, so it is handled
             # exactly like a missing one below. The error itself is not swallowed: mapping the same
             # frame raises it again, and `__aiter__` reports it as a recoverable frame error.
-            response_data = {}
-        if not response_data:
             # A `response.done` with no usable `response` object is malformed, but it is still the only
             # terminal we will ever get for the response it was meant to close. Treating it as "no
             # information" leaves `_response_active` set forever, and every later `create_response()`
@@ -749,8 +712,11 @@ class OpenAIRealtimeConnection(RealtimeConnection):
                 self._pending_response = False
                 await self._request_response()
             return events, False
-        done = ResponseDoneEvent.construct(**data)
         response = done.response
+        function_call_only = bool(response.output) and all(item.type == 'function_call' for item in response.output)
+        finish_reason = (
+            'tool_call' if response.status == 'completed' and function_call_only else response_finish_reason(response)
+        )
         response_id = response.id
         # The cancelled response is now closed; stop suppressing its stragglers (its own usage still emits
         # below). A no-op for any other response.
@@ -791,34 +757,30 @@ class OpenAIRealtimeConnection(RealtimeConnection):
             if response.status != 'cancelled' or was_client_cancel:
                 self._response_active = True
                 self._active_response_id = None
-                await self._send_event({'type': 'response.create'})
+                await self._send_event({'type': RESPONSE_CREATE_EVENT})
         # Validated only now that all the response state above is settled: a malformed usage payload
         # raises `ValueError`, which `__aiter__` surfaces as a recoverable frame error and keeps reading
         # — but this `response.done` was still the terminal for its response, and bailing before the
         # state updates would leave `_response_active` held forever, queueing every later
         # `response.create` behind a response that already ended.
-        _validate_usage_shape(response_data.get('usage'))
         # Emit usage for every response (including intermediate function-call-only ones) so the session
         # accounts for all tokens. Only the active response may replay a pending request; a late completion
         # for a superseded response must not change current state. OpenAI nests usage under
         # `response.usage`; xAI Grok Voice reports the same shape at the top level of the `response.done`
         # frame (its `response.usage` is empty), so fall back to it.
-        top_level_usage = (done.model_extra or {}).get('usage')  # xAI frame-level provider extra.
-        _validate_usage_shape(top_level_usage)
-        usage = self._map_response_usage(response.usage) or self._map_response_usage(
-            RealtimeResponseUsage.construct(**top_level_usage) if is_str_dict(top_level_usage) else None
-        )
+        frame_usage = done.usage if isinstance(done, ProtocolResponseDoneEvent) else None
+        usage = self._map_response_usage(response.usage) or self._map_response_usage(frame_usage)
         if usage is not None:
             events.append(
-                SessionUsageEvent(
+                SessionUsage(
                     usage=usage,
                     provider_response_id=response_id or None,
-                    finish_reason=response_finish_reason(response),
+                    finish_reason=finish_reason,
                 )
             )
-        elif matches_active_response and response_finish_reason(response) == 'tool_call':
+        elif matches_active_response and finish_reason == 'tool_call':
             events.append(
-                SessionUsageEvent(
+                SessionUsage(
                     usage=RequestUsage(),
                     provider_response_id=response_id or None,
                     finish_reason='tool_call',
@@ -891,25 +853,22 @@ class OpenAIRealtimeModel(RealtimeModel):
         model: The model name, e.g. `gpt-realtime` or `gpt-realtime-2.1-mini`.
         provider: The provider to use for authentication and the base URL. Defaults to `'openai'`.
             Azure OpenAI is not supported (its realtime endpoint uses a different URL and auth scheme).
+        settings: [Model settings][pydantic_ai.realtime.RealtimeModelSettings] used as defaults for
+            realtime sessions.
         profile: Optional override for the [realtime model profile][pydantic_ai.realtime.RealtimeModelProfile],
             merged over the provider's — a partial dict, or a callable taking the resolved profile and
             returning the one to use. Mirrors `profile=` on a standard
             [`Model`][pydantic_ai.models.Model], and is the escape hatch when a model name doesn't
             identify the model (e.g. an Azure deployment named something other than its model).
-        reconnect: Optional [`ReconnectPolicy`][pydantic_ai.realtime.ReconnectPolicy] to transparently
-            recover from a dropped connection. With no policy, the low-level connection reports a
-            non-recoverable session error; `RealtimeSession` raises
-            [`RealtimeError`][pydantic_ai.realtime.RealtimeError] from iteration.
     """
 
     # The connection class `connect` yields; a protocol clone (Azure) overrides it to correct the
     # vendor a closed or rejecting connection names in its errors.
     _connection_type: ClassVar[type[OpenAIRealtimeConnection]] = OpenAIRealtimeConnection
 
-    model: str = 'gpt-realtime'
+    model: OpenAIRealtimeModelName
     _: KW_ONLY
     settings: RealtimeModelSettings | None = None
-    reconnect: ReconnectPolicy | None = None
     _provider: Provider[AsyncOpenAI] = field(init=False, repr=False)
 
     # Written out rather than generated because `profile` has to be an init argument while
@@ -917,16 +876,14 @@ class OpenAIRealtimeModel(RealtimeModel):
     # dataclass field of that name would shadow the property.
     def __init__(
         self,
-        model: str = 'gpt-realtime',
+        model: OpenAIRealtimeModelName,
         *,
         provider: Provider[AsyncOpenAI] | str = 'openai',
         settings: RealtimeModelSettings | None = None,
         profile: RealtimeModelProfileSpec | None = None,
-        reconnect: ReconnectPolicy | None = None,
     ) -> None:
         self.model = model
         self.settings = settings
-        self.reconnect = reconnect
         self._profile = profile
         self._provider = self._resolve_provider(provider)
 
@@ -949,7 +906,7 @@ class OpenAIRealtimeModel(RealtimeModel):
         return self._provider.client
 
     @property
-    def model_name(self) -> str:
+    def model_name(self) -> OpenAIRealtimeModelName:
         return self.model
 
     @property
@@ -960,6 +917,7 @@ class OpenAIRealtimeModel(RealtimeModel):
         self,
         instructions: str,
         tools: list[ToolDefinition] | None,
+        *,
         model_settings: OpenAIRealtimeModelSettings | None,
     ) -> dict[str, Any]:
         model_settings = cast('OpenAIRealtimeModelSettings', self._merge_model_settings(model_settings) or {})
@@ -968,10 +926,10 @@ class OpenAIRealtimeModel(RealtimeModel):
         elif 'turn_detection' in model_settings:
             turn_detection = resolve_base_turn_detection(model_settings['turn_detection'])
         else:
-            turn_detection = ServerVAD()
+            turn_detection: ServerVAD | SemanticVAD | None = {'type': 'server_vad'}
         # `turn_detection` is always set: a dict enables VAD, `None` (explicit null) disables it.
         audio_input: dict[str, Any] = {
-            'format': {'type': 'audio/pcm', 'rate': 24000},
+            'format': {'type': 'audio/pcm', 'rate': self.profile.get('audio_input_sample_rate', 24000)},
             'turn_detection': turn_detection_config(turn_detection),
         }
         transcription_model = resolve_transcription_model(
@@ -981,7 +939,9 @@ class OpenAIRealtimeModel(RealtimeModel):
             audio_input['transcription'] = {'model': transcription_model}
         if (noise_reduction := model_settings.get('openai_input_noise_reduction')) is not None:
             audio_input['noise_reduction'] = {'type': noise_reduction}
-        audio_output: dict[str, Any] = {'format': {'type': 'audio/pcm', 'rate': 24000}}
+        audio_output: dict[str, Any] = {
+            'format': {'type': 'audio/pcm', 'rate': self.profile.get('audio_output_sample_rate', 24000)}
+        }
         if voice := model_settings.get('openai_voice'):
             audio_output['voice'] = voice.model_dump() if isinstance(voice, VoiceID) else voice
         if (output_speed := model_settings.get('openai_output_speed')) is not None:
@@ -1014,11 +974,6 @@ class OpenAIRealtimeModel(RealtimeModel):
         return config
 
     def _realtime_ws_base(self) -> str:
-        """The realtime WebSocket URL before the session query is added.
-
-        The seam Azure OpenAI overrides: its realtime path follows from the resource endpoint rather
-        than from the provider's `base_url`, and both URLs below have to honor that.
-        """
         return realtime_websocket_url(self._provider.base_url)
 
     def _realtime_url(self, model_settings: OpenAIRealtimeModelSettings | None = None) -> str:
@@ -1026,53 +981,32 @@ class OpenAIRealtimeModel(RealtimeModel):
         return with_realtime_query(self._realtime_ws_base(), model=self.model)
 
     def _sideband_url(self, call_id: str) -> str:
-        """The control-plane WebSocket URL that attaches to an existing WebRTC call by `call_id`."""
         return with_realtime_query(self._realtime_ws_base(), call_id=call_id)
 
     def _webrtc_http_base(self) -> str:
-        """The HTTP base URL for realtime signaling, always ending in `/` (e.g. `https://api.openai.com/v1/`).
-
-        May carry a query string, which the base URL owns (a gateway tenant, a routing key).
-        `_webrtc_url` keeps it after the endpoint path rather than letting the path fall into it.
-        """
         base_url, separator, query = self._provider.base_url.partition('?')
         base_url = base_url if base_url.endswith('/') else f'{base_url}/'
         return f'{base_url}{separator}{query}'
 
     def _webrtc_url(self, path: str, **params: str) -> str:
-        """A realtime signaling URL: the HTTP base, then `path`, then the merged query.
-
-        The path lands *before* any query the base URL carries — appending it after would bury the
-        endpoint inside the query and send the request to the base URL itself. Same rule as
-        `realtime_websocket_url` applies to the WebSocket handshake.
-        """
         base_url, _, query = self._webrtc_http_base().partition('?')
-        base_url = base_url if base_url.endswith('/') else f'{base_url}/'
         for name, value in params.items():
             param = f'{name}={quote(value, safe="")}'
             query = f'{query}&{param}' if query else param
-        return f'{base_url}{path}?{query}' if query else f'{base_url}{path}'
+        url = f'{base_url}{path}'
+        return f'{url}?{query}' if query else url
 
     def _webrtc_calls_url(self) -> str:
-        """The `/realtime/calls` signaling endpoint the browser's SDP offer is relayed to."""
         return self._webrtc_url('realtime/calls')
 
     def _webrtc_client_secrets_url(self) -> str:
-        """The `/realtime/client_secrets` endpoint that mints ephemeral browser tokens."""
         return self._webrtc_url('realtime/client_secrets')
 
     @property
     def _http_client(self) -> httpx.AsyncClient:
-        """The provider's configured `httpx` client, reused for realtime WebRTC signaling."""
         return self._provider.client._client  # pyright: ignore[reportPrivateUsage]
 
     async def _webrtc_headers(self) -> dict[str, str]:
-        """Non-auth default headers from the provider client, plus this model's realtime auth header.
-
-        Auth (`Authorization: Bearer` for OpenAI, `api-key` or Entra `Bearer` for Azure) comes from
-        `_auth_headers`, replacing whatever the SDK client carries by default, so a single code path
-        signs both the OpenAI and Azure requests.
-        """
         headers = {
             key: value
             for key, value in self._provider.client.default_headers.items()
@@ -1087,15 +1021,10 @@ class OpenAIRealtimeModel(RealtimeModel):
         tools: Sequence[ToolDefinition] | None,
         model_settings: RealtimeModelSettings | None,
     ) -> dict[str, Any]:
-        """The `session` object sent to `/realtime/calls` and `/realtime/client_secrets`.
-
-        Unlike the WebSocket handshake, which carries the model in the `?model=` query, the WebRTC
-        signaling endpoints read the model from the session body, so it is injected here.
-        """
         settings = cast('OpenAIRealtimeModelSettings | None', model_settings)
         return {
             'model': self.model,
-            **self._session_config(instructions or '', list(tools) if tools else None, settings),
+            **self._session_config(instructions or '', list(tools) if tools else None, model_settings=settings),
         }
 
     async def create_client_secret(
@@ -1147,65 +1076,47 @@ class OpenAIRealtimeModel(RealtimeModel):
                 f'model connects through {self.system!r}. Answer the offer and attach the sideband with the '
                 'same model/provider.'
             )
-        url = self._sideband_url(session.session_id)
         settings = cast('OpenAIRealtimeModelSettings', self._merge_model_settings(model_settings) or {})
         handshake_timeout = settings.get('handshake_timeout', 30.0)
         instructions = get_instructions(messages, model_request_parameters) or ''
-        session_config = self._session_config(instructions, model_request_parameters.function_tools, settings)
+        session_config = self._session_config(
+            instructions, model_request_parameters.function_tools, model_settings=settings
+        )
         transcription_enabled = settings.get('input_transcription_model', 'auto') is not None
-        # Converted before dialing, like `connect`: content this provider can't replay is the caller's
-        # mistake, not the API's, so it stays outside `map_connect_errors`.
         seed = await seed_items(messages, profile=self.profile, provider_name=self.system)
-
+        url = self._sideband_url(session.session_id)
         cm: AbstractAsyncContextManager[ClientConnection] | None = None
         server_model: str | None = None
 
         async def dial() -> ClientConnection:
             nonlocal cm, server_model
-            if cm is not None:
+            if cm is not None:  # pragma: no branch
                 previous, cm = cm, None
                 await previous.__aexit__(None, None, None)
-            # Resolved per dial, like `connect`: a reconnect must carry freshly resolved credentials (an
-            # Entra token expires mid-call) and this handshake's own trace context, not the first dial's.
             headers = await self._auth_headers()
             inject_trace_context(headers)
             opening = websockets.connect(url, additional_headers=headers)
             ws = await opening.__aenter__()
             cm = opening
-            # The call already exists (created when the SDP offer was relayed), so the control WebSocket
-            # doesn't emit `session.created`: apply the session config immediately and wait for
-            # `session.updated`, which also reports the served model.
-            await ws.send(json.dumps({'type': 'session.update', 'session': session_config}))
-            updated = await expect_event(ws, 'session.updated', timeout=handshake_timeout)
-            session = updated.get('session')
-            model = session.get('model') if is_str_dict(session) else None
-            if isinstance(model, str) and model:
-                server_model = model
+            # Existing WebRTC calls do not emit `session.created`; configure immediately and wait
+            # for `session.updated` instead of using `connect_openai_protocol`'s new-session handshake.
+            await ws.send(to_json({'type': SESSION_UPDATE_EVENT, 'session': session_config}).decode())
+            updated = await expect_event(ws, SESSION_UPDATED_EVENT, timeout=handshake_timeout)
+            server_model = _SidebandSessionUpdated.model_validate(updated).session.model
             return ws
 
         try:
-            # Map a rejected sideband upgrade (expired/unknown `call_id`, bad auth, rate limit) to the
-            # same typed exceptions `connect` raises, so attaching to a call fails like dialing a
-            # session does. The reconnect loop dials outside this manager, as there.
             with map_connect_errors(self.model):
                 ws = await dial()
-                # Seed prior conversation once, after the handshake (as the WebSocket path does).
                 for item in seed:
-                    await ws.send(json.dumps({'type': 'conversation.item.create', 'item': item}))
-            # Through the same seam `connect` uses, so an Azure sideband's errors name Azure rather
-            # than the OpenAI protocol it borrows.
+                    await ws.send(to_json({'type': CONVERSATION_ITEM_CREATE_EVENT, 'item': item}).decode())
             yield self._connection_type(
                 ws,
                 dial=dial,
-                reconnect=self.reconnect,
+                reconnect=settings.get('reconnect'),
                 input_transcription_enabled=transcription_enabled,
                 model_name=server_model,
-                # Read live rather than snapshotted: a re-dial's `session.updated` refreshes
-                # `server_model`, and the connection must report what the server serves now.
                 model_name_getter=lambda: server_model,
-                # The media flows browser <-> provider, so this connection never sees output-audio
-                # deltas: it must not clamp a truncation against a byte counter that stays zero, and a
-                # barge-in has to drop the provider's outbound buffer the browser is still playing.
                 observes_output_audio=False,
             )
         finally:
@@ -1240,6 +1151,17 @@ class OpenAIRealtimeModel(RealtimeModel):
         del model_settings
         return self._connection_type
 
+    def _session_model_name(self, created: dict[str, Any], model_settings: OpenAIRealtimeModelSettings) -> str | None:
+        """The server-reported model name from the `session.created` handshake frame.
+
+        Settings-aware because a provider's handshake shape can vary by *session*: Azure Voice Live's
+        beta `session.created` doesn't carry the GA `type` discriminator this SDK model requires.
+        """
+        del model_settings
+        session = SessionCreatedEvent.model_validate(created).session
+        model = session.model if isinstance(session, RealtimeSessionCreateRequest) else None
+        return model if isinstance(model, str) else None
+
     @asynccontextmanager
     async def connect(
         self,
@@ -1249,75 +1171,49 @@ class OpenAIRealtimeModel(RealtimeModel):
         model_request_parameters: ModelRequestParameters,
     ) -> AsyncGenerator[OpenAIRealtimeConnection]:
         settings = cast('OpenAIRealtimeModelSettings', self._merge_model_settings(model_settings) or {})
-        url = self._realtime_url(settings)
         handshake_timeout = settings.get('handshake_timeout', 30.0)
         instructions = get_instructions(messages, model_request_parameters) or ''
-        session_config = self._session_config(instructions, model_request_parameters.function_tools, settings)
+        session_config = self._session_config(
+            instructions=instructions, tools=model_request_parameters.function_tools, model_settings=settings
+        )
         transcription_enabled = settings.get('input_transcription_model', 'auto') is not None
-        # Convert the history to seed items before dialing. Content this provider can't replay is the
-        # caller's mistake, not the API's, so it should surface as a `UserError` without a socket ever
-        # being opened -- and stay outside `map_connect_errors`, which is only about reaching the API.
-        seed = await seed_items(messages, profile=self.profile, provider_name=self.system)
 
-        # `dial` opens and configures a fresh connection. A reconnect closes the previous connection
-        # (including one left half-open by a failed handshake) before opening the next, so sockets
-        # don't accumulate; teardown closes whatever is current.
-        cm: AbstractAsyncContextManager[ClientConnection] | None = None
-
-        # The model the server reports actually serving, from the `session.created` handshake; it can
-        # differ from the requested id (see `RealtimeConnection.model_name`).
-        server_model: str | None = None
-
-        # Assigned once the connection exists, which is *after* `dial` is defined but before it can be
-        # called again: a re-dial reads the call so far off it and replays it (see `set_conversation`).
-        connection: OpenAIRealtimeConnection | None = None
-
-        async def dial() -> ClientConnection:
-            nonlocal cm, server_model
-            if cm is not None:
-                previous, cm = cm, None
-                await previous.__aexit__(None, None, None)
+        async def dial_headers() -> dict[str, str]:
             headers = await self._auth_headers(settings)
             # The raw WebSocket bypasses the provider's `httpx` client, so every fresh handshake must
             # carry the current trace context as well as freshly resolved authentication.
             inject_trace_context(headers)
-            opening = websockets.connect(url, additional_headers=headers)
-            ws = await opening.__aenter__()
-            cm = opening
-            created = await expect_event(ws, 'session.created', timeout=handshake_timeout)
-            session = SessionCreatedEvent.construct(**created).session
-            model = session.model if isinstance(session, RealtimeSessionCreateRequest) else None
-            if isinstance(model, str) and model:
-                server_model = model
-            await ws.send(json.dumps({'type': 'session.update', 'session': session_config}))
-            await expect_event(ws, 'session.updated', timeout=handshake_timeout)
-            if connection is not None and (conversation := connection.conversation) is not None:
-                # A re-dial: the API keeps nothing across sessions, so replay the call to continue it.
-                for item in await replay_items(conversation(), profile=self.profile, provider_name=self.system):
-                    await ws.send(json.dumps({'type': 'conversation.item.create', 'item': item}))
-            return ws
+            return headers
 
-        try:
-            # Map a rejected config or WebSocket upgrade to the same typed exceptions a regular request
-            # raises. The reconnect loop dials outside this manager, so it keeps treating a drop as
-            # retryable rather than fatal.
-            with map_connect_errors(self.model):
-                ws = await dial()
-                # Seed prior conversation after the initial handshake. A *re*-dial replays the call so far
-                # instead (from inside `dial`), which supersedes this history.
-                for item in seed:
-                    await ws.send(json.dumps({'type': 'conversation.item.create', 'item': item}))
-            connection = self._connection_class(settings)(
+        def session_model(created: dict[str, Any]) -> str | None:
+            return self._session_model_name(created, settings)
+
+        def build_connection(
+            ws: ClientConnection,
+            dial: Callable[[], Awaitable[ClientConnection]],
+            server_model: str | None,
+            model_name_getter: Callable[[], str | None],
+        ) -> OpenAIRealtimeConnection:
+            return self._connection_class(settings)(
                 ws,
                 dial=dial,
-                reconnect=self.reconnect,
+                reconnect=settings.get('reconnect'),
                 input_transcription_enabled=transcription_enabled,
                 model_name=server_model,
-                model_name_getter=lambda: server_model,
+                model_name_getter=model_name_getter,
             )
+
+        async with connect_openai_protocol(
+            model_name=self.model,
+            messages=messages,
+            profile=self.profile,
+            provider_name=self.system,
+            session_config=session_config,
+            handshake_timeout=handshake_timeout,
+            dial_headers=dial_headers,
+            dial_url=lambda: self._realtime_url(settings),
+            session_model=session_model,
+            build_connection=build_connection,
+            replay_on_redial=True,
+        ) as connection:
             yield connection
-        finally:
-            # Coverage cannot attribute a failed `__aenter__` to the false exit arc; the behavior is
-            # exercised by `test_connect_open_failure_propagates_without_teardown`.
-            if cm is not None:  # pragma: no branch
-                await cm.__aexit__(None, None, None)

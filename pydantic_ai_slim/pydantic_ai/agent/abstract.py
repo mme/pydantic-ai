@@ -1706,9 +1706,8 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
         """Bind this agent's configuration to a realtime `model`, returning an accessor for realtime operations.
 
         The returned [`AgentRealtime`][pydantic_ai.agent.AgentRealtime] carries the agent's realtime
-        configuration so that opening a session with [`session()`][pydantic_ai.agent.AgentRealtime.session] —
-        and, where the model supports it, browser WebRTC signaling — reuses the same instructions, tools,
-        capabilities, and run context without re-passing them.
+        configuration so that opening a session with [`session()`][pydantic_ai.agent.AgentRealtime.session]
+        reuses the same instructions, tools, capabilities, and run context without re-passing them.
 
         These parameters mirror [`iter`][pydantic_ai.agent.AbstractAgent.iter]. Parameters specific to the
         request-response graph — `output_type`, `retries`, `event_stream_handler`, `deferred_tool_results` —
@@ -1802,11 +1801,20 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
         usage: _usage.RunUsage | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
         metadata: AgentMetadata[AgentDepsT] | None = None,
         conversation_id: str | None = None,
+        run_id: str | None = None,
         message_history: Sequence[_messages.ModelMessage] | None = None,
+        run_lifecycle: bool = False,
     ) -> AsyncGenerator[_RealtimeSessionResolution[AgentDepsT]]:
-        """Resolve the agent configuration shared by realtime sessions and WebRTC signaling."""
+        """Resolve the agent configuration shared by realtime sessions and WebRTC signaling.
+
+        With `run_lifecycle`, the run-lifecycle hooks are dispatched around the resolved configuration
+        so they wrap the toolset — and the session the caller opens inside them — exactly as `iter`
+        does. Only `_open_realtime_session` asks for that: signaling only reads back the instructions
+        and tools a session would advertise, and is not itself a run.
+        """
         raise NotImplementedError
         yield
 
@@ -2096,9 +2104,9 @@ class AgentRealtime(Generic[AgentDepsT]):
     """An agent bound to a realtime model, returned by [`AbstractAgent.realtime`][pydantic_ai.agent.AbstractAgent.realtime].
 
     Carries the agent's realtime configuration (mirroring the parameters of
-    [`iter`][pydantic_ai.agent.AbstractAgent.iter]) so that opening a session — and, where the model
-    supports it, browser WebRTC signaling — reuses the same instructions, tools, capabilities, and run
-    context without re-passing them. Construct it via [`agent.realtime(model, ...)`][pydantic_ai.agent.AbstractAgent.realtime],
+    [`iter`][pydantic_ai.agent.AbstractAgent.iter]) so that opening a session reuses the same
+    instructions, tools, capabilities, and run context without re-passing them. Construct it via
+    [`agent.realtime(model, ...)`][pydantic_ai.agent.AbstractAgent.realtime],
     then open a session with [`session()`][pydantic_ai.agent.AgentRealtime.session].
     """
 

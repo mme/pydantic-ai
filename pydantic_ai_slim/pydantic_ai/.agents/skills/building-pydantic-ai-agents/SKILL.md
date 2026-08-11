@@ -226,8 +226,12 @@ over, the model has said everything it is going to say, and it is the user's tur
 
 ```python {test="skip"}
 from pydantic_ai import Agent
-from pydantic_ai.messages import SpeechPart, SpeechPartDelta
-from pydantic_ai.realtime import PartDeltaEvent, PartEndEvent, TurnDetection
+from pydantic_ai.messages import (
+    PartDeltaEvent,
+    PartEndEvent,
+    SpeechPart,
+    SpeechPartDelta,
+)
 from pydantic_ai.realtime.openai import OpenAIRealtimeModelSettings
 
 agent = Agent(instructions='You are a helpful voice assistant.')
@@ -235,7 +239,7 @@ agent = Agent(instructions='You are a helpful voice assistant.')
 
 async def main(microphone_chunk: bytes):
     settings = OpenAIRealtimeModelSettings(
-        openai_voice='alloy', turn_detection=TurnDetection(sensitivity='high')
+        openai_voice='alloy', turn_detection={'sensitivity': 'high'}
     )
     async with agent.realtime(
         'openai:gpt-realtime', model_settings=settings

@@ -23,8 +23,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.realtime import RealtimeModelProfile, RealtimeTurnCompleteEvent
-from pydantic_ai.realtime._base import RealtimeSessionErrorEvent
+from pydantic_ai.realtime import RealtimeModelProfile, RealtimeSessionErrorEvent, RealtimeTurnCompleteEvent
 
 from ..conftest import IsDatetime, IsStr, try_import
 from .ws_cassettes import RealtimeCassette
@@ -186,6 +185,7 @@ async def test_audio_in_server_vad_turn(
         # Voice Live's session config takes `modalities: ['text']`, so text output is supported.
         supports_text_output=True,
         supports_tool_return_schema=False,  # no native surface; opted-in schemas go into descriptions
+        emits_input_speech_events=True,
         audio_input_sample_rate=24000,
         audio_output_sample_rate=24000,
         supports_thinking=False,

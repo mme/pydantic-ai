@@ -1,43 +1,25 @@
 # Usage and observability
 
-Realtime sessions accumulate standard [`RunUsage`][pydantic_ai.usage.RunUsage], enforce standard
-[`UsageLimits`][pydantic_ai.usage.UsageLimits], and emit OpenTelemetry spans through Pydantic AI's
-normal instrumentation. This lets voice and follow-up text runs share one usage budget and trace.
+Realtime audio bills by the second in both directions, so knowing what a session cost — and capping
+it — matters even more than for a text run. Realtime sessions accumulate standard
+[`RunUsage`][pydantic_ai.usage.RunUsage], enforce standard
+[`UsageLimits`][pydantic_ai.usage.UsageLimits], and emit OpenTelemetry spans — viewable in
+[Pydantic Logfire](../logfire.md) — through Pydantic AI's normal instrumentation. This lets voice
+and follow-up text runs share one usage budget and trace.
 
 ## Usage and limits
 
 Read cumulative usage from
 [`RealtimeSession.usage`][pydantic_ai.realtime.RealtimeSession.usage]. It includes input/output
 tokens, provider audio and cache breakdowns where available, and tool-call counts. Usage updates are
-not emitted as session events.
+not emitted as session events. As with a standard run's
+[usage limits](../agent.md#usage-limits), pass `usage=` to accumulate into a shared object — for
+example one carried across a voice call and its follow-up text runs — and `usage_limits=` to cap a
+session:
 
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.realtime import RealtimeTurnCompleteEvent
-from pydantic_ai.realtime.openai import OpenAIRealtimeModel
-
-agent = Agent()
-
-
-async def main():
-    async with agent.realtime(OpenAIRealtimeModel('gpt-realtime')).session() as session:
-        await session.send('Say hello.')
-        async for event in session:
-            if isinstance(event, RealtimeTurnCompleteEvent):
-                break
-        print(session.usage)
-        #> RunUsage(requests=1)
-```
-
-Input-transcription usage is reported separately in `RunUsage.details` under
-`input_transcription_*` keys. It is not included in response token totals or attributed to a
-`ModelResponse`, because transcription can use a separate model and billing meter.
-
-Pass `usage=` to accumulate into a shared object and `usage_limits=` to cap a session:
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai.realtime.openai import OpenAIRealtimeModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 agent = Agent()
@@ -46,12 +28,21 @@ shared = RunUsage()
 
 async def main():
     async with agent.realtime(
-        OpenAIRealtimeModel('gpt-realtime'),
+        'openai:gpt-realtime',
         usage=shared,
         usage_limits=UsageLimits(total_tokens_limit=100_000),
     ).session() as session:
         await session.send('Say hello.')
+        async for event in session:
+            if isinstance(event, RealtimeTurnCompleteEvent):
+                break
+        print(shared)
+        #> RunUsage(requests=1)
 ```
+
+Input-transcription usage is reported separately in `RunUsage.details` under
+`input_transcription_*` keys. It is not included in response token totals or attributed to a
+`ModelResponse`, because transcription can use a separate model and billing meter.
 
 Token and tool-call limits are checked as usage accrues. Request limits are checked before sending
 text, explicitly creating a response, or returning a tool result. With server-side VAD, the provider
@@ -78,16 +69,22 @@ logfire.instrument_pydantic_ai()
 The session creates an `invoke_agent` span with cumulative usage and conversation content, subject
 to the normal content-redaction setting. Nested `chat {model}` spans represent provider responses,
 and `execute_tool` spans represent tools and delegated agent runs. `model turn complete` and `interrupt`
-spans mark those boundaries. A tool round can produce several response spans within one turn. A
-boundary drawn by a cancelled or interrupted response displays as `model turn complete (interrupted)` — on
-providers that automatically respond to each detected speech segment (OpenAI server VAD), a user who
-keeps talking cancels each auto-response, producing boundary spans with no response span between
-them.
+spans mark those boundaries. A tool round can produce several response spans within one turn.
 
-All spans set `pydantic_ai.realtime=True`; response spans set `gen_ai.output.type` to `speech` or
-`text`. Interrupted responses record `pydantic_ai.response.state='interrupted'`. OpenAI, Azure
-OpenAI, and xAI response spans include response-level usage. Gemini can report usage only on a later
-completed turn after a function-call response; cumulative session usage remains authoritative.
+You may see runs of `model turn complete (interrupted)` spans with no `chat` span between them.
+That's normal on OpenAI server VAD: the provider starts a response for each detected speech segment,
+so a user who keeps talking cancels each auto-response before it produces output. Every cancelled or
+interrupted response still draws a boundary, displayed as `model turn complete (interrupted)`.
+
+| Attribute | Set on | Meaning |
+| --- | --- | --- |
+| `pydantic_ai.realtime` | Spans the session emits itself (session, response, boundary, and `user speech` spans) | Always `True`; marks spans that belong to a realtime session. `execute_tool` spans come from the [`Instrumentation`][pydantic_ai.capabilities.Instrumentation] capability and don't carry it. |
+| `gen_ai.output.type` | Response spans | `speech` or `text`. |
+| `pydantic_ai.response.state` | Interrupted response spans | `'interrupted'`. |
+| Response-level usage | OpenAI, Azure OpenAI, and xAI response spans | Tokens attributed to that response. |
+
+Gemini can report usage only on a later completed turn after a function-call response; cumulative
+session usage remains authoritative.
 
 When providers report both user speech start and end, Pydantic AI records a `user speech` span.
 Providers without both boundaries do not get a guessed duration.
@@ -106,7 +103,8 @@ See [Debugging and monitoring](../logfire.md) for Logfire setup and privacy cont
 
 ## Gateway trace propagation
 
-Gateway routing is provider configuration, documented on the
+Routing through the [Pydantic AI Gateway](../gateway.md) — e.g.
+`agent.realtime('gateway/openai:gpt-realtime')` — is provider configuration, documented on the
 [OpenAI](openai.md#gateway) and [Gemini](gemini.md#gateway) pages. When a span is active during the
 WebSocket handshake, Pydantic AI propagates
 [W3C trace context](https://www.w3.org/TR/trace-context/) so gateway spans can join the trace.
@@ -118,14 +116,13 @@ session context in an outer span when the handshake itself must be included:
 import logfire
 
 from pydantic_ai import Agent
-from pydantic_ai.realtime.openai import OpenAIRealtimeModel
 
 agent = Agent()
 
 
 async def main():
     with logfire.span('voice call'):
-        async with agent.realtime(OpenAIRealtimeModel('gpt-realtime')).session() as session:
+        async with agent.realtime('openai:gpt-realtime').session() as session:
             await session.send('Say hello.')
 ```
 

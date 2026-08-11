@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from threading import Event as ThreadEvent
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
 import pytest
@@ -32,6 +32,7 @@ from pydantic_ai.exceptions import (
     UserError,
 )
 from pydantic_ai.messages import (
+    BinaryAudio,
     BinaryContent,
     BinaryImage,
     DeferredToolRequestsEvent,
@@ -48,9 +49,11 @@ from pydantic_ai.messages import (
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
+    RealtimeSessionErrorEvent,
     RetryPromptPart,
     SpeechPart,
     SpeechPartDelta,
+    SystemPromptPart,
     TextPart,
     TextPartDelta,
     ToolCallPart,
@@ -64,7 +67,6 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.native_tools import AbstractNativeTool, CodeExecutionTool, WebFetchTool, WebSearchTool
 from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.realtime import (
-    AudioInput,
     RealtimeError,
     RealtimeEvent,
     RealtimeInputSpeechEndEvent,
@@ -78,21 +80,15 @@ from pydantic_ai.realtime import (
     RealtimeTurnCompleteEvent,
     TranscriptUpdate,
 )
-from pydantic_ai.realtime._base import (
-    ConversationCreated,
-    ConversationItemCreated,
-    ImageInput,
-    RealtimeSessionErrorEvent,
-    TextInput,
-    resolve_advertised_tools,
-    seed_pcm_audio,
-    seed_speech_content,
-)
+from pydantic_ai.realtime._session import _pending_message_text  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.realtime._utils import resolve_advertised_tools, seed_pcm_audio, seed_speech_content
 from pydantic_ai.realtime.codec import (
     AudioDelta,
     CancelResponse,
     ClearAudio,
     CommitAudio,
+    ConversationCreated,
+    ConversationItemCreated,
     CreateResponse,
     InputTranscript,
     OutputTranscript,
@@ -100,7 +96,7 @@ from pydantic_ai.realtime.codec import (
     RealtimeConnection,
     RealtimeInput,
     ResponseDone,
-    SessionUsageEvent,
+    SessionUsage,
     ToolCall,
     ToolCallCancelled,
     ToolResult,
@@ -160,7 +156,7 @@ def test_seed_pcm_audio_rejects_truncated_wav() -> None:
     truncated = BinaryContent(data=audio.data[:-2], media_type='audio/wav')
 
     with pytest.raises(UserError, match='not valid WAV audio'):
-        seed_pcm_audio(truncated, provider_name='test', sample_rate=24000)
+        seed_pcm_audio(audio=truncated, provider_name='test', sample_rate=24000)
 
 
 async def _noop_runner(name: str, args: dict[str, Any], call_id: str) -> str:  # pragma: no cover
@@ -221,7 +217,14 @@ def test_runner_toolset_has_stable_id() -> None:
 
 def RealtimeSession(connection: RealtimeConnection, runner: Any = _noop_runner, **kwargs: Any) -> _RealtimeSession:
     """Construct a session with the real `ToolManager` API while keeping test setup compact."""
-    return _RealtimeSession(connection, make_tool_manager(runner), **kwargs)
+    if any(name in kwargs for name in ('model_name', 'provider_name', 'provider_url')):
+        kwargs['model'] = FakeRealtimeModel(
+            connection,
+            model_name=kwargs.pop('model_name', None),
+            system=kwargs.pop('provider_name', None),
+            base_url=kwargs.pop('provider_url', None),
+        )
+    return _RealtimeSession(connection, tool_manager=make_tool_manager(runner), **kwargs)
 
 
 async def collect_events(session: _RealtimeSession) -> list[RealtimeEvent]:
@@ -316,10 +319,16 @@ class FakeRealtimeModel(RealtimeModel):
         *,
         settings: RealtimeModelSettings | None = None,
         profile: RealtimeModelProfile | None = None,
+        model_name: str | None = 'fake-realtime',
+        system: str | None = 'fake',
+        base_url: str | None = None,
     ) -> None:
         self._connection = connection
         self.settings = settings
         self._fixed_profile = profile or _profile()
+        self._model_name = model_name
+        self._system = system
+        self._base_url = base_url
         self.last_instructions: str | None = None
         self.last_tools: list[ToolDefinition] | None = None
         self.last_native_tools: list[AbstractNativeTool] | None = None
@@ -328,11 +337,15 @@ class FakeRealtimeModel(RealtimeModel):
 
     @property
     def model_name(self) -> str:
-        return 'fake-realtime'
+        return cast('str', self._model_name)
 
     @property
     def system(self) -> str:
-        return 'fake'
+        return cast('str', self._system)
+
+    @property
+    def base_url(self) -> str | None:
+        return self._base_url
 
     @property
     def profile(self) -> RealtimeModelProfile:
@@ -561,7 +574,7 @@ async def test_send_only_session_still_runs_tools() -> None:
             await ran.wait()
             while len(conn.sent) < 2:
                 await asyncio.sleep(0)
-    assert [type(sent).__name__ for sent in conn.sent] == ['TextInput', 'ToolResult']
+    assert [type(sent).__name__ for sent in conn.sent] == ['str', 'ToolResult']
 
 
 async def test_close_discards_buffered_view_items() -> None:
@@ -591,7 +604,13 @@ async def test_session_reports_the_connected_model_profile() -> None:
     agent = Agent()
     async with agent.realtime(model).session() as session:
         assert session.profile == profile
-        assert session.profile.get('audio_input_sample_rate') == 16000
+        # The sample-rate properties are the supported read surface: they resolve the profile keys and
+        # supply the 24 kHz default for keys a profile omits, so callers never index the profile dict.
+        assert session.audio_input_sample_rate == 16000
+        assert session.audio_output_sample_rate == 24000
+    # The same properties exist on the model, for configuring capture/playback before a session exists.
+    assert model.audio_input_sample_rate == 16000
+    assert model.audio_output_sample_rate == 24000
 
 
 async def test_close_ends_views_and_is_idempotent() -> None:
@@ -703,8 +722,8 @@ async def test_multiple_assistant_items_fold_into_one_response() -> None:
         [
             ModelResponse(
                 parts=[
-                    SpeechPart(speaker='assistant', transcript='first', id='item-1', provider_name='openai'),
-                    TextPart(content='second', id='item-2', provider_name='openai'),
+                    SpeechPart(speaker='assistant', transcript='first'),
+                    TextPart(content='second'),
                 ],
                 provider_name='openai',
                 provider_response_id='response-1',
@@ -850,8 +869,8 @@ async def test_interleaved_user_transcripts_use_item_ids() -> None:
 
     parts = [message.parts[0] for message in session.new_messages() if isinstance(message, ModelRequest)]
     assert parts == [
-        SpeechPart(speaker='user', transcript='first turn', id='item-1', provider_name='openai'),
-        SpeechPart(speaker='user', transcript='second turn', id='item-2', provider_name='openai'),
+        SpeechPart(speaker='user', transcript='first turn'),
+        SpeechPart(speaker='user', transcript='second turn'),
     ]
 
 
@@ -867,11 +886,11 @@ async def test_session_close_flushes_user_transcripts_blocked_by_missing_final()
 
     assert session.new_messages() == [
         ModelRequest(
-            parts=[SpeechPart(speaker='user', transcript='first partial', id='item-1', provider_name='openai')],
+            parts=[SpeechPart(speaker='user', transcript='first partial')],
             timestamp=IsDatetime(),
         ),
         ModelRequest(
-            parts=[SpeechPart(speaker='user', transcript='second final', id='item-2', provider_name='openai')],
+            parts=[SpeechPart(speaker='user', transcript='second final')],
             timestamp=IsDatetime(),
         ),
     ]
@@ -995,7 +1014,7 @@ async def test_input_transcription_failure_passes_through_and_session_continues(
     ]
     assert session.new_messages() == snapshot(
         [
-            ModelRequest(parts=[SpeechPart(speaker='user', id='user-1')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user')], timestamp=IsDatetime()),
             ModelRequest(parts=[SpeechPart(speaker='user')], timestamp=IsDatetime()),
         ]
     )
@@ -1016,8 +1035,8 @@ async def test_input_transcription_failure_after_partial_does_not_block_later_tu
     _ = await collect_events(session)
     assert session.new_messages() == snapshot(
         [
-            ModelRequest(parts=[SpeechPart(speaker='user', id='A')], timestamp=IsDatetime()),
-            ModelRequest(parts=[SpeechPart(speaker='user', transcript='hello from B', id='B')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user', transcript='hello from B')], timestamp=IsDatetime()),
         ]
     )
 
@@ -1042,17 +1061,23 @@ async def test_input_transcription_failure_ends_the_part_it_opened() -> None:
     session = RealtimeSession(conn, _noop_runner)
 
     events: list[RealtimeEvent] = []
+    failed_index: int | None = None
     async with session:
         async for event in session:  # pragma: no branch
             events.append(event)
-            if isinstance(event, PartEndEvent) and isinstance(event.part, SpeechPart) and event.part.id == 'B':
+            if (
+                isinstance(event, PartDeltaEvent)
+                and isinstance(event.delta, SpeechPartDelta)
+                and event.delta.transcript == 'partial B'
+            ):
+                failed_index = event.index
+            if isinstance(event, PartEndEvent) and event.index == failed_index:
                 # C is still streaming: B's failure must not mark the whole user side idle.
                 assert session._user_turn_active  # pyright: ignore[reportPrivateUsage]
 
-    started = {e.part.id: e.index for e in events if isinstance(e, PartStartEvent) and isinstance(e.part, SpeechPart)}
-    ended = {e.part.id: e.index for e in events if isinstance(e, PartEndEvent) and isinstance(e.part, SpeechPart)}
-    assert started['B'] != 0
-    assert ended['B'] == started['B']
+    assert failed_index is not None and failed_index != 0
+    assert any(isinstance(event, PartStartEvent) and event.index == failed_index for event in events)
+    assert any(isinstance(event, PartEndEvent) and event.index == failed_index for event in events)
 
 
 async def test_input_transcription_failure_ignores_already_closed_items() -> None:
@@ -1076,14 +1101,14 @@ async def test_input_transcription_failure_ignores_already_closed_items() -> Non
 
     events = await collect_events(session)
 
-    ended = [e.part.id for e in events if isinstance(e, PartEndEvent) and isinstance(e.part, SpeechPart)]
-    assert ended == ['A', 'B']
+    ended = [e.part for e in events if isinstance(e, PartEndEvent) and isinstance(e.part, SpeechPart)]
+    assert ended == [SpeechPart(speaker='user', transcript='hello from A'), SpeechPart(speaker='user')]
     user_parts = [
         part for message in session.new_messages() if isinstance(message, ModelRequest) for part in message.parts
     ]
     assert user_parts == [
-        SpeechPart(speaker='user', transcript='hello from A', id='A'),
-        SpeechPart(speaker='user', id='B'),
+        SpeechPart(speaker='user', transcript='hello from A'),
+        SpeechPart(speaker='user'),
     ]
 
 
@@ -1098,7 +1123,7 @@ async def test_input_transcription_failure_retained_audio_fallback(item_id: str 
 
     expected_audio = _wav_content(b'\xaa') if item_id is None else None
     assert session.new_messages() == [
-        ModelRequest(parts=[SpeechPart(speaker='user', audio=expected_audio, id=item_id)], timestamp=IsDatetime())
+        ModelRequest(parts=[SpeechPart(speaker='user', audio=expected_audio)], timestamp=IsDatetime())
     ]
 
 
@@ -1147,8 +1172,8 @@ async def test_explicit_interrupt_records_audio_offset_on_last_speech_part() -> 
         [
             ModelResponse(
                 parts=[
-                    SpeechPart(speaker='assistant', transcript='first', id='item-1'),
-                    SpeechPart(speaker='assistant', transcript='second', interrupted_at_ms=640, id='item-2'),
+                    SpeechPart(speaker='assistant', transcript='first'),
+                    SpeechPart(speaker='assistant', transcript='second', interrupted_at_ms=640),
                 ],
                 model_name='m',
                 timestamp=IsDatetime(),
@@ -1185,7 +1210,6 @@ async def test_deltas_still_in_flight_when_a_cancel_lands_stay_in_the_interrupte
                         speaker='assistant',
                         transcript='I was saying something',
                         interrupted_at_ms=120,
-                        id='item-1',
                     )
                 ],
                 model_name='m',
@@ -1221,7 +1245,7 @@ async def test_interrupted_turn_without_trailing_speech_records_no_offset() -> N
     assert not any(isinstance(part, SpeechPart) for part in response.parts)
 
 
-async def test_speech_part_provider_item_id_and_gemini_fallback() -> None:
+async def test_speech_parts_do_not_persist_provider_item_ids() -> None:
     openai = RealtimeSession(
         FakeRealtimeConnection([OutputTranscript(text='hello', is_final=True, item_id='item-a'), ResponseDone()]),
         _noop_runner,
@@ -1238,7 +1262,7 @@ async def test_speech_part_provider_item_id_and_gemini_fallback() -> None:
     openai_part = openai.new_messages()[0].parts[0]
     gemini_part = gemini.new_messages()[0].parts[0]
     assert isinstance(openai_part, SpeechPart) and isinstance(gemini_part, SpeechPart)
-    assert (openai_part.id, openai_part.provider_name) == ('item-a', 'openai')
+    assert (openai_part.id, openai_part.provider_name) == (None, None)
     assert (gemini_part.id, gemini_part.provider_name) == (None, None)
 
 
@@ -1480,7 +1504,7 @@ async def test_tool_response_finalized_on_usage_is_not_duplicated_at_terminal() 
                 args='{}',
                 response_usage_follows=True,
             ),
-            SessionUsageEvent(
+            SessionUsage(
                 usage=RequestUsage(output_tokens=1),
                 provider_response_id='response-tool',
                 finish_reason='tool_call',
@@ -1656,7 +1680,7 @@ async def test_tool_runner_cancelled_call_ends_cleanly() -> None:
     assert conn.sent == []
     results = [event for event in events if isinstance(event, FunctionToolResultEvent)]
     assert len(results) == 1 and isinstance(results[0].part, ToolReturnPart)
-    assert results[0].part.content == 'Tool call cancelled before it completed.'
+    assert results[0].part.content == 'The tool call was interrupted before a result was produced.'
 
 
 async def test_validation_hook_exception_reports_failed_validation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2158,7 +2182,7 @@ async def test_tool_call_cancellation_cancels_running_tool() -> None:
         if isinstance(part, ToolReturnPart)
     ]
     assert [(part.tool_call_id, part.content) for part in returns] == [
-        ('c1', 'Tool call cancelled before it completed.')
+        ('c1', 'The tool call was interrupted before a result was produced.')
     ]
 
 
@@ -2401,22 +2425,22 @@ async def test_send_helpers_forward_to_connection() -> None:
     await session.send_audio(b'\x01\x02')
     await session.send('hello')
     await session.send(BinaryImage(data=b'\xff\xd8', media_type='image/jpeg'))
-    await session.send(AudioInput(data=b'\x03'))
+    await session.send(BinaryAudio(data=b'\x03', media_type='audio/pcm'))
     assert conn.sent == [
-        AudioInput(data=b'\x01\x02'),
-        TextInput(text='hello'),
-        ImageInput(data=b'\xff\xd8', media_type='image/jpeg'),
-        AudioInput(data=b'\x03'),
+        BinaryAudio(data=b'\x01\x02', media_type='audio/pcm'),
+        'hello',
+        BinaryImage(data=b'\xff\xd8', media_type='image/jpeg'),
+        BinaryAudio(data=b'\x03', media_type='audio/pcm'),
     ]
 
 
 async def test_send_dispatches_through_bookkeeping_helpers() -> None:
-    # `send(TextInput(...))` must route through `send_text`, so the user turn lands in history rather
+    # `send(<str>)` must route through the text-turn path, so the user turn lands in history rather
     # than bypassing it (the raw pass-through used to skip all session bookkeeping).
     conn = FakeRealtimeConnection([])
     session = RealtimeSession(conn, _noop_runner)
-    await session.send(TextInput(text='hello'))
-    assert conn.sent == [TextInput(text='hello')]
+    await session.send('hello')
+    assert conn.sent == ['hello']
     assert session.new_messages() == snapshot(
         [ModelRequest(parts=[UserPromptPart(content='hello', timestamp=IsDatetime())], timestamp=IsDatetime())]
     )
@@ -2435,10 +2459,10 @@ async def test_send_accepts_plain_content() -> None:
 
     assert conn.sent == snapshot(
         [
-            TextInput(text='hello'),
-            ImageInput(data=b'image', media_type='image/png'),
-            AudioInput(data=b'\x01\x02\x03\x04'),
-            AudioInput(data=b'\xaa\xbb'),
+            'hello',
+            BinaryImage(data=b'image', media_type='image/png'),
+            BinaryAudio(data=b'\x01\x02\x03\x04', media_type='audio/pcm'),
+            BinaryAudio(data=b'\xaa\xbb', media_type='audio/pcm'),
         ]
     )
     assert session.new_messages() == snapshot(
@@ -2463,7 +2487,7 @@ async def test_send_accepts_sequence() -> None:
 
     await session.send(['look at this', BinaryImage(data=b'image', media_type='image/png')])
 
-    assert conn.sent == [TextInput(text='look at this'), ImageInput(data=b'image', media_type='image/png')]
+    assert conn.sent == ['look at this', BinaryImage(data=b'image', media_type='image/png')]
 
 
 async def test_image_history_retention_samples_and_round_trips() -> None:
@@ -2474,7 +2498,7 @@ async def test_image_history_retention_samples_and_round_trips() -> None:
     for image in images:
         await session.send(image)
 
-    assert conn.sent == [ImageInput(data=image.data, media_type='image/png') for image in images]
+    assert conn.sent == [BinaryImage(data=image.data, media_type='image/png') for image in images]
     assert session.all_messages() == [
         ModelRequest(parts=[UserPromptPart(content=[images[0]], timestamp=IsDatetime())], timestamp=IsDatetime()),
         ModelRequest(parts=[UserPromptPart(content=[images[2]], timestamp=IsDatetime())], timestamp=IsDatetime()),
@@ -2488,7 +2512,7 @@ async def test_failed_unretained_image_send_has_nothing_to_take_back() -> None:
     # there is no phantom history to roll back; the failure still propagates.
     class _SecondImageSendFails(FakeRealtimeConnection):
         async def send(self, content: RealtimeInput) -> None:
-            if isinstance(content, ImageInput) and self.sent:
+            if isinstance(content, BinaryImage) and self.sent:
                 raise RuntimeError('send failed')
             await super().send(content)
 
@@ -2523,7 +2547,7 @@ async def test_image_history_cap_evicts_oldest() -> None:
         await session.send(image)
 
     # Every frame still reached the provider; only the local record is bounded.
-    assert conn.sent == [ImageInput(data=image.data, media_type='image/png') for image in images]
+    assert conn.sent == [BinaryImage(data=image.data, media_type='image/png') for image in images]
     assert session.all_messages() == [
         ModelRequest(parts=[UserPromptPart(content=[images[2]], timestamp=IsDatetime())], timestamp=IsDatetime()),
         ModelRequest(parts=[UserPromptPart(content=[images[3]], timestamp=IsDatetime())], timestamp=IsDatetime()),
@@ -2551,7 +2575,7 @@ async def test_image_history_cap_zero_retains_nothing() -> None:
 
     await session.send(image)
 
-    assert conn.sent == [ImageInput(data=image.data, media_type='image/png')]
+    assert conn.sent == [BinaryImage(data=image.data, media_type='image/png')]
     assert session.all_messages() == []
 
 
@@ -2585,32 +2609,11 @@ async def test_send_rejects_raw_bytes_with_audio_hint() -> None:
 
 
 async def test_send_enforces_model_profile_guard() -> None:
-    # `send(ImageInput(...))` must enforce the same `supports_image_input` guard as `send_image`.
+    # `send(BinaryImage(...))` must enforce the same `supports_image_input` guard as `send_image`.
     conn = FakeRealtimeConnection([])
     session = RealtimeSession(conn, _noop_runner, profile=_profile(supports_image_input=False))
     with pytest.raises(UserError, match='does not support image input'):
-        await session.send(ImageInput(data=b'\xff', media_type='image/jpeg'))
-    assert conn.sent == []
-
-
-async def test_send_rejects_control_verbs() -> None:
-    # Turn-control verbs are connection-level vocabulary excluded from `RealtimeSessionInput`; `send()`
-    # rejects them at runtime and directs callers to the dedicated methods (which apply profile guards).
-    conn = FakeRealtimeConnection([])
-    session = RealtimeSession(conn, _noop_runner)
-    for verb in (CommitAudio(), ClearAudio(), CreateResponse(), CancelResponse(), TruncateOutput(audio_end_ms=120)):
-        with pytest.raises(UserError, match=r'Turn-control verbs cannot be sent.*commit_audio'):
-            await session.send(verb)  # type: ignore[arg-type]
-    assert conn.sent == []
-
-
-async def test_send_rejects_tool_result() -> None:
-    # Tool results are sent by the session itself; a caller can't inject one via `send()`. `ToolResult`
-    # is excluded from `RealtimeSessionInput` (hence the type-ignore), so this also guards the runtime path.
-    conn = FakeRealtimeConnection([])
-    session = RealtimeSession(conn, _noop_runner)
-    with pytest.raises(UserError, match='Tool results are sent automatically'):
-        await session.send(ToolResult(tool_call_id='c', output='x'))  # type: ignore[arg-type]
+        await session.send(BinaryImage(data=b'\xff', media_type='image/jpeg'))
     assert conn.sent == []
 
 
@@ -2635,7 +2638,7 @@ async def test_send_during_response_is_recorded_after_response() -> None:
 
     class MidResponseConnection(RealtimeConnection):
         async def send(self, content: RealtimeInput) -> None:
-            assert content == TextInput(text='next turn')
+            assert content == 'next turn'
 
         async def __aiter__(self) -> AsyncIterator[RealtimeCodecEvent]:
             yield OutputTranscript(text='first ', item_id='assistant-1')
@@ -2663,7 +2666,7 @@ async def test_send_during_response_is_recorded_after_response() -> None:
     assert session.new_messages() == snapshot(
         [
             ModelResponse(
-                parts=[SpeechPart(speaker='assistant', transcript='first response', id='assistant-1')],
+                parts=[SpeechPart(speaker='assistant', transcript='first response')],
                 provider_response_id='response-1',
                 timestamp=IsDatetime(),
                 finish_reason='stop',
@@ -2732,7 +2735,7 @@ async def test_failed_sends_leave_no_phantom_history_or_audio() -> None:
     with pytest.raises(RuntimeError, match='send failed'):
         await session.send('question')
     with pytest.raises(RuntimeError, match='send failed'):
-        await session.send(TextInput(text='typed question'))
+        await session.send('typed question')
     with pytest.raises(RuntimeError, match='send failed'):
         await session.send_audio(b'\xaa\xbb')
     conn.fail = False
@@ -2851,8 +2854,8 @@ def test_remove_sent_request_ignores_unknown_request() -> None:
 async def test_session_accumulates_usage_and_requests() -> None:
     conn = FakeRealtimeConnection(
         [
-            SessionUsageEvent(usage=RequestUsage(input_tokens=10, output_tokens=5)),
-            SessionUsageEvent(usage=RequestUsage(input_tokens=3, output_tokens=2)),
+            SessionUsage(usage=RequestUsage(input_tokens=10, output_tokens=5)),
+            SessionUsage(usage=RequestUsage(input_tokens=3, output_tokens=2)),
             OutputTranscript(text='ok', is_final=True),
             ResponseDone(),
         ]
@@ -2958,7 +2961,7 @@ async def test_concurrent_image_and_text_history_matches_wire_order() -> None:
 
     class _PausedImageConnection(FakeRealtimeConnection):
         async def send(self, content: RealtimeInput) -> None:
-            if isinstance(content, ImageInput):
+            if isinstance(content, BinaryImage):
                 image_send_started.set()
                 await release_image.wait()
             await super().send(content)
@@ -2972,7 +2975,7 @@ async def test_concurrent_image_and_text_history_matches_wire_order() -> None:
     release_image.set()
     await asyncio.gather(image_task, text_task)
 
-    assert [type(frame) for frame in conn.sent] == [ImageInput, TextInput]
+    assert [type(frame) for frame in conn.sent] == [BinaryImage, str]
     image_request, text_request = session.new_messages()
     assert isinstance(image_request, ModelRequest)
     assert isinstance(text_request, ModelRequest)
@@ -3000,7 +3003,7 @@ async def test_interrupt_truncate_and_cancel_cannot_be_split() -> None:
     truncate = kinds.index('TruncateOutput')
     assert kinds[truncate + 1] == 'CancelResponse', f'a frame was interleaved into the transaction: {kinds}'
     # The concurrent sends still all got through, just never in the middle.
-    assert kinds.count('TextInput') == 3
+    assert kinds.count('str') == 3
 
 
 async def test_image_input_guard() -> None:
@@ -3024,7 +3027,7 @@ async def test_owns_media_guard() -> None:
         await session.clear_audio()
     # The routing through `send()` (audio input / audio bytes) is gated by the same guard.
     with pytest.raises(UserError, match='does not own the audio transport'):
-        await session.send(AudioInput(data=b'\x00\x00'))
+        await session.send(BinaryAudio(data=b'\x00\x00', media_type='audio/pcm'))
     with pytest.raises(UserError, match='does not own the audio transport'):
         await session.send(BinaryContent(data=b'\x00\x00', media_type='audio/pcm'))
     with pytest.raises(UserError, match='browser exchanges audio with the provider directly over WebRTC'):
@@ -3040,7 +3043,7 @@ async def test_owns_media_default_allows_audio() -> None:
         await asyncio.sleep(0)
         await session.send_audio(b'\x00\x00')
         assert await audio == b'\x01\x02'
-    assert conn.sent == [AudioInput(data=b'\x00\x00')]
+    assert conn.sent == [BinaryAudio(data=b'\x00\x00', media_type='audio/pcm')]
 
 
 async def test_early_break_cancels_pump() -> None:
@@ -3216,7 +3219,7 @@ async def test_audio_retention_segmentation_follows_provider_boundaries() -> Non
     _ = await collect_events(gemini_session)
 
     assert openai_session.new_messages()[0] == ModelRequest(
-        parts=[SpeechPart(speaker='user', transcript='hello', audio=_wav_content(b'speech'), id='turn')],
+        parts=[SpeechPart(speaker='user', transcript='hello', audio=_wav_content(b'speech'))],
         timestamp=IsDatetime(),
     )
     assert gemini_session.new_messages()[0] == ModelRequest(
@@ -3438,22 +3441,22 @@ async def test_session_offers_the_conversation_for_replay_when_seeding_is_suppor
     class _RecordsConversation(FakeRealtimeConnection):
         def __init__(self, events: list[RealtimeCodecEvent]) -> None:
             super().__init__(events)
-            self.conversation: Callable[[], Sequence[ModelMessage]] | None = None
+            self.message_history: Callable[[], Sequence[ModelMessage]] | None = None
 
-        def set_conversation(self, conversation: Callable[[], Sequence[ModelMessage]]) -> None:
-            self.conversation = conversation
+        def set_message_history(self, message_history: Callable[[], Sequence[ModelMessage]]) -> None:
+            self.message_history = message_history
 
     seeding = _RecordsConversation([])
     async with RealtimeSession(seeding, profile=_profile(supports_session_seeding=True)) as session:
         await session.send('hello')
-    assert seeding.conversation is not None
+    assert seeding.message_history is not None
     # A live view, not a snapshot: the call grows after the connection is handed it.
-    assert [type(m).__name__ for m in seeding.conversation()] == ['ModelRequest']
+    assert [type(m).__name__ for m in seeding.message_history()] == ['ModelRequest']
 
     no_seeding = _RecordsConversation([])
     async with RealtimeSession(no_seeding, profile=_profile(supports_session_seeding=False)):
         pass
-    assert no_seeding.conversation is None
+    assert no_seeding.message_history is None
 
 
 async def test_reconnect_while_idle_passes_through() -> None:
@@ -3525,16 +3528,15 @@ async def test_queued_message_flushes_when_reconnect_closes_orphaned_turn() -> N
 
     # The orphaned reply is closed as interrupted, the turn ends, and the queued prompt goes out.
     assert any(isinstance(e, RealtimeTurnCompleteEvent) for e in events)
-    assert [item.text for item in conn.sent if isinstance(item, TextInput)] == ['queued for the boundary']
+    assert [item for item in conn.sent if isinstance(item, str)] == ['queued for the boundary']
     responses = [m for m in session.all_messages() if isinstance(m, ModelResponse)]
     assert responses[-1].state == 'interrupted'
 
 
 async def test_reconnect_finalizes_multiple_in_flight_user_items() -> None:
     # Two overlapping user turns (partial transcripts routed by item id), with the second finalizing
-    # out of order: `u2` leaves `_active_users_by_id` but stays queued in `_user_item_order` behind the
-    # still-open `u1`. A lost-state reconnect must finalize the still-active `u1` and skip the
-    # already-finalized `u2` (which the pending-flush emits in order), so neither turn is dropped or
+    # out of order: `u2` is finalized in `_user_turns` behind the still-open `u1`. A lost-state
+    # reconnect must finalize `u1` and then flush both in order, so neither turn is dropped or
     # double-recorded.
     conn = FakeRealtimeConnection(
         [
@@ -3550,8 +3552,8 @@ async def test_reconnect_finalizes_multiple_in_flight_user_items() -> None:
     await collect_events(session)
     assert session.new_messages() == snapshot(
         [
-            ModelRequest(parts=[SpeechPart(speaker='user', transcript='first turn', id='u1')], timestamp=IsDatetime()),
-            ModelRequest(parts=[SpeechPart(speaker='user', transcript='second turn', id='u2')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user', transcript='first turn')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user', transcript='second turn')], timestamp=IsDatetime()),
             ModelResponse(
                 parts=[SpeechPart(speaker='assistant', transcript='after')],
                 timestamp=IsDatetime(),
@@ -3599,7 +3601,7 @@ async def test_reconnect_cancels_obsolete_tool_call() -> None:
     result = request.parts[0]
     assert isinstance(result, ToolReturnPart)
     assert result.tool_name == 'slow'
-    assert result.content == 'Tool call cancelled before it completed.'
+    assert result.content == 'The tool call was interrupted before a result was produced.'
     assert result.tool_call_id == 'old-call'
     assert result.outcome == 'interrupted'
 
@@ -3664,11 +3666,11 @@ async def test_input_audio_segmented_by_item_id_across_overlapping_turns() -> No
     assert session.new_messages() == snapshot(
         [
             ModelRequest(
-                parts=[SpeechPart(speaker='user', transcript='second', audio=_wav_content(b'\xbb'), id='B')],
+                parts=[SpeechPart(speaker='user', transcript='second', audio=_wav_content(b'\xbb'))],
                 timestamp=IsDatetime(),
             ),
             ModelRequest(
-                parts=[SpeechPart(speaker='user', transcript='first', audio=_wav_content(b'\xaa'), id='A')],
+                parts=[SpeechPart(speaker='user', transcript='first', audio=_wav_content(b'\xaa'))],
                 timestamp=IsDatetime(),
             ),
         ]
@@ -3690,10 +3692,8 @@ async def test_retained_input_audio_kept_when_transcription_fails() -> None:
     _ = await collect_events(session)
     assert session.new_messages() == snapshot(
         [
-            ModelRequest(
-                parts=[SpeechPart(speaker='user', audio=_wav_content(b'\xaa'), id='A')], timestamp=IsDatetime()
-            ),
-            ModelRequest(parts=[SpeechPart(speaker='user', transcript='hi', id='B')], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user', audio=_wav_content(b'\xaa'))], timestamp=IsDatetime()),
+            ModelRequest(parts=[SpeechPart(speaker='user', transcript='hi')], timestamp=IsDatetime()),
         ]
     )
 
@@ -3803,7 +3803,7 @@ async def test_duplicate_final_input_transcript_is_idempotent() -> None:
     _ = await collect_events(session)
 
     assert session.all_messages() == [
-        ModelRequest(parts=[SpeechPart(speaker='user', transcript='hello', id='user-1')], timestamp=IsDatetime())
+        ModelRequest(parts=[SpeechPart(speaker='user', transcript='hello')], timestamp=IsDatetime())
     ]
 
 
@@ -3896,8 +3896,8 @@ async def test_handoff_to_standard_agent_run() -> None:
 async def test_contentless_speech_parts_are_skipped_for_seeding_and_text_handoff() -> None:
     user = SpeechPart(speaker='user')
     assistant = SpeechPart(speaker='assistant')
-    assert seed_speech_content(user, provider_name='test', supports_audio=False) == ''
-    assert seed_speech_content(assistant, provider_name='test', supports_audio=False) == ''
+    assert seed_speech_content(part=user, provider_name='test', supports_audio=False) == ''
+    assert seed_speech_content(part=assistant, provider_name='test', supports_audio=False) == ''
 
     captured: list[ModelMessage] = []
 
@@ -4427,7 +4427,7 @@ class _EnqueueConnection(FakeRealtimeConnection):
         # Let the pending-message task observe that response usage is still outstanding. The queued
         # prompt must remain deferred until the usage event finalizes the tool-call response.
         await asyncio.sleep(0)
-        yield SessionUsageEvent(usage=RequestUsage(input_tokens=1, output_tokens=1))
+        yield SessionUsage(usage=RequestUsage(input_tokens=1, output_tokens=1))
         yield ResponseDone()
 
 
@@ -4471,8 +4471,8 @@ async def test_asap_enqueue_waits_for_active_response_to_complete() -> None:
     async with agent.realtime(FakeRealtimeModel(conn)).session() as session:
         _ = [event async for event in session]
 
-    assert not any(isinstance(item, TextInput) for item in conn.sent_before_response_complete)
-    assert [item.text for item in conn.sent if isinstance(item, TextInput)] == ['follow-up context']
+    assert not any(isinstance(item, str) for item in conn.sent_before_response_complete)
+    assert [item for item in conn.sent if isinstance(item, str)] == ['follow-up context']
 
 
 @pytest.mark.parametrize(
@@ -4491,7 +4491,7 @@ async def test_agent_realtime_session_delivers_enqueued_text(priority: Literal['
     async with agent.realtime(FakeRealtimeModel(conn)).session() as session:
         _ = [event async for event in session]
 
-    assert [type(item).__name__ for item in conn.sent] == ['ToolResult', 'TextInput']
+    assert [type(item).__name__ for item in conn.sent] == ['ToolResult', 'str']
     call_response, tool_return, followup = session.new_messages()
     assert isinstance(call_response, ModelResponse) and isinstance(call_response.parts[0], ToolCallPart)
     assert isinstance(tool_return, ModelRequest) and isinstance(tool_return.parts[0], ToolReturnPart)
@@ -4513,7 +4513,7 @@ class _ConcurrentEnqueueConnection(FakeRealtimeConnection):
 
     async def send(self, content: RealtimeInput) -> None:
         self.sent.append(content)
-        if isinstance(content, TextInput) and content.text == 'first':
+        if content == 'first':
             self.first_send_started.set()
             while not self.second_enqueued.is_set():
                 await asyncio.sleep(0)
@@ -4542,7 +4542,7 @@ async def test_sync_tool_enqueue_during_drain_is_not_lost() -> None:
     async with agent.realtime(FakeRealtimeModel(conn)).session() as session:
         _ = [event async for event in session]
 
-    assert [item.text for item in conn.sent if isinstance(item, TextInput)] == ['first', 'second']
+    assert [item for item in conn.sent if isinstance(item, str)] == ['first', 'second']
     prompts = [
         part.content
         for message in session.new_messages()
@@ -4563,7 +4563,7 @@ async def test_agent_realtime_session_rejects_non_text_enqueue() -> None:
 
     conn = FakeRealtimeConnection([ToolCall(tool_call_id='tc', tool_name='queue_image', args='{}')])
     async with agent.realtime(FakeRealtimeModel(conn)).session() as session:
-        with pytest.raises(UserError, match='currently supports one plain-text prompt per call'):
+        with pytest.raises(UserError, match='supports plain-text prompts and system-prompt parts only'):
             _ = [event async for event in session]
 
 
@@ -4571,7 +4571,8 @@ async def test_agent_realtime_session_rejects_non_text_enqueue() -> None:
     'messages',
     [
         [ModelResponse(parts=[TextPart(content='not a request')])],
-        [ModelRequest(parts=[UserPromptPart(content='one'), UserPromptPart(content='two')])],
+        [ModelRequest(parts=[UserPromptPart(content=[BinaryImage(data=b'x', media_type='image/png')])])],
+        [ModelRequest(parts=[])],
     ],
 )
 async def test_realtime_pending_messages_reject_unsupported_message_shapes(messages: list[ModelMessage]) -> None:
@@ -4579,8 +4580,20 @@ async def test_realtime_pending_messages_reject_unsupported_message_shapes(messa
     manager = session._tool_manager  # pyright: ignore[reportPrivateUsage]
     assert manager.ctx is not None
     assert manager.ctx.pending_messages is not None
-    with pytest.raises(UserError, match='one plain-text prompt per call'):
+    with pytest.raises(UserError, match='supports plain-text prompts and system-prompt parts only'):
         manager.ctx.pending_messages.append(PendingMessage(messages=messages))
+
+
+def test_realtime_pending_messages_join_text_and_tag_system_prompts() -> None:
+    # Multiple text parts join across messages, and a mid-conversation `SystemPromptPart` degrades to
+    # `<system>`-tagged user text — the same treatment `Model.prepare_messages` applies in a standard run.
+    pending = PendingMessage(
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content='one'), SystemPromptPart(content='rule')]),
+            ModelRequest(parts=[UserPromptPart(content='two')]),
+        ]
+    )
+    assert _pending_message_text(pending) == 'one\n\n<system>rule</system>\n\ntwo'
 
 
 async def test_session_exit_is_idempotent_and_flushes_unfinalized_user() -> None:
@@ -4597,7 +4610,7 @@ async def test_session_exit_is_idempotent_and_flushes_unfinalized_user() -> None
 
 def test_session_accepts_unprepared_tool_manager_without_pending_context() -> None:
     manager = ToolManager(FunctionToolset())
-    session = _RealtimeSession(FakeRealtimeConnection([]), manager)
+    session = _RealtimeSession(FakeRealtimeConnection([]), tool_manager=manager)
     assert session._tool_manager.ctx is None  # pyright: ignore[reportPrivateUsage]
 
 
@@ -4624,7 +4637,7 @@ async def test_replayed_items_are_suppressed_by_item_and_tool_call_id() -> None:
     assert session.new_messages() == []
 
 
-async def test_existing_assistant_speech_adopts_late_item_id() -> None:
+async def test_existing_assistant_speech_associates_late_item_id_in_session_state() -> None:
     session = RealtimeSession(
         FakeRealtimeConnection(
             [
@@ -4642,7 +4655,8 @@ async def test_existing_assistant_speech_adopts_late_item_id() -> None:
     assert isinstance(response, ModelResponse)
     part = response.parts[0]
     assert isinstance(part, SpeechPart)
-    assert part.id == 'assistant-item'
+    assert part.id is None
+    assert len(response.parts) == 1
 
 
 async def test_empty_finalized_user_precedes_later_item() -> None:
@@ -4657,27 +4671,8 @@ async def test_empty_finalized_user_precedes_later_item() -> None:
     _ = await collect_events(session)
 
     assert session.new_messages() == [
-        ModelRequest(parts=[SpeechPart(speaker='user', id='empty')], timestamp=IsDatetime()),
-        ModelRequest(parts=[SpeechPart(speaker='user', transcript='kept', id='kept')], timestamp=IsDatetime()),
-    ]
-
-
-async def test_session_close_recovers_finalized_user_orphaned_from_ordered_stream() -> None:
-    session = RealtimeSession(FakeRealtimeConnection([]))
-    session._user_item_order.append('missing')  # pyright: ignore[reportPrivateUsage]
-    session._user_item_order.append('empty')  # pyright: ignore[reportPrivateUsage]
-    session._finalized_users_by_id['empty'] = SpeechPart(speaker='user')  # pyright: ignore[reportPrivateUsage]
-    session._user_item_order.append('orphan')  # pyright: ignore[reportPrivateUsage]
-    session._finalized_users_by_id['orphan'] = SpeechPart(  # pyright: ignore[reportPrivateUsage]
-        speaker='user', transcript='recovered'
-    )
-
-    async with session:
-        pass
-
-    assert session.new_messages() == [
         ModelRequest(parts=[SpeechPart(speaker='user')], timestamp=IsDatetime()),
-        ModelRequest(parts=[SpeechPart(speaker='user', transcript='recovered')], timestamp=IsDatetime()),
+        ModelRequest(parts=[SpeechPart(speaker='user', transcript='kept')], timestamp=IsDatetime()),
     ]
 
 
@@ -4740,15 +4735,15 @@ async def test_tool_completion_drains_messages_deferred_until_usage_arrives(monk
     validation_done = asyncio.Event()
 
     async def complete_after_usage(
-        call: ToolCall,
         call_part: ToolCallPart,
+        *,
         validation_done: asyncio.Event,
         execution_prerequisites: tuple[asyncio.Event, ...],
-        *,
+        response_usage_follows: bool,
         run_step: int,
         reserved_budget: bool,
     ) -> tuple[ToolReturnPart, None]:
-        del call, validation_done, execution_prerequisites
+        del validation_done, execution_prerequisites, response_usage_follows
         del run_step, reserved_budget
         session._tool_calls_awaiting_usage.clear()  # pyright: ignore[reportPrivateUsage]
         return ToolReturnPart(tool_name=call_part.tool_name, content='done', tool_call_id=call_part.tool_call_id), None
@@ -4757,18 +4752,18 @@ async def test_tool_completion_drains_messages_deferred_until_usage_arrives(monk
     monkeypatch.setattr(session, '_execute_tool', complete_after_usage)
     completion = asyncio.Event()
     await session._run_tool(  # pyright: ignore[reportPrivateUsage]
-        ToolCall(tool_call_id='call', tool_name='noop', args='{}'),
         ToolCallPart(tool_name='noop', args={}, tool_call_id='call'),
-        validation_done,
-        (),
-        completion,
+        validation_done=validation_done,
+        execution_prerequisites=(),
+        completion=completion,
+        response_usage_follows=True,
         run_step=0,
         reserved_budget=True,
         order_index=0,
         ordered_events=False,
     )
 
-    assert TextInput('after tool') in conn.sent
+    assert 'after tool' in conn.sent
 
 
 async def test_deferred_asap_drain_failure_after_tool_is_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4778,9 +4773,9 @@ async def test_deferred_asap_drain_failure_after_tool_is_forwarded(monkeypatch: 
     # unretrieved-task-exception warning at GC, silently losing the enqueued follow-up.
     class _FailingDrain(FakeRealtimeConnection):
         async def send(self, content: RealtimeInput) -> None:
-            if isinstance(content, TextInput):
+            if isinstance(content, str):
                 raise RuntimeError('drain send failed')
-            # This test only drives the drain's `TextInput` send.
+            # This test only drives the drain's text-turn send.
             await super().send(content)  # pragma: no cover
 
     conn = _FailingDrain([])
@@ -4791,15 +4786,15 @@ async def test_deferred_asap_drain_failure_after_tool_is_forwarded(monkeypatch: 
     )
 
     async def complete_after_usage(
-        call: ToolCall,
         call_part: ToolCallPart,
+        *,
         validation_done: asyncio.Event,
         execution_prerequisites: tuple[asyncio.Event, ...],
-        *,
+        response_usage_follows: bool,
         run_step: int,
         reserved_budget: bool,
     ) -> tuple[ToolReturnPart, None]:
-        del call, validation_done, execution_prerequisites
+        del validation_done, execution_prerequisites, response_usage_follows
         del run_step, reserved_budget
         session._tool_calls_awaiting_usage.clear()  # pyright: ignore[reportPrivateUsage]
         return ToolReturnPart(tool_name=call_part.tool_name, content='done', tool_call_id=call_part.tool_call_id), None
@@ -4809,11 +4804,11 @@ async def test_deferred_asap_drain_failure_after_tool_is_forwarded(monkeypatch: 
 
     task = asyncio.create_task(
         session._run_tool(  # pyright: ignore[reportPrivateUsage]
-            ToolCall(tool_call_id='call', tool_name='noop', args='{}'),
             ToolCallPart(tool_name='noop', args={}, tool_call_id='call'),
-            asyncio.Event(),
-            (),
-            asyncio.Event(),
+            validation_done=asyncio.Event(),
+            execution_prerequisites=(),
+            completion=asyncio.Event(),
+            response_usage_follows=True,
             run_step=0,
             reserved_budget=True,
             order_index=0,
@@ -4939,7 +4934,7 @@ async def test_iterator_reuses_receive_pump_started_by_session_owner() -> None:
     session = RealtimeSession(FakeRealtimeConnection([ResponseDone()]))
     async with session:
         session._pump_task = asyncio.create_task(  # pyright: ignore[reportPrivateUsage]
-            session._pump(session._session_span_context)  # pyright: ignore[reportPrivateUsage]
+            session._pump(session._session_instrumentation.context)  # pyright: ignore[reportPrivateUsage]
         )
         assert [event async for event in session] == [RealtimeTurnCompleteEvent()]
 
@@ -5265,7 +5260,7 @@ async def test_tools_from_one_response_share_a_run_step() -> None:
         [
             ToolCall(tool_call_id='tc1', tool_name='barrier', args='{}', response_usage_follows=True),
             ToolCall(tool_call_id='tc2', tool_name='follower', args='{}', response_usage_follows=True),
-            SessionUsageEvent(usage=RequestUsage(input_tokens=10, output_tokens=5)),
+            SessionUsage(usage=RequestUsage(input_tokens=10, output_tokens=5)),
             ResponseDone(),
         ]
     )
@@ -5543,7 +5538,7 @@ async def test_agent_realtime_session_send_audio() -> None:
     model = FakeRealtimeModel(conn)
     async with agent.realtime(model).session() as session:
         await session.send_audio(b'\xab\xcd')
-    assert conn.sent == [AudioInput(data=b'\xab\xcd')]
+    assert conn.sent == [BinaryAudio(data=b'\xab\xcd', media_type='audio/pcm')]
 
 
 # --- parity with run/iter: instructions, toolsets, usage, usage_limits, capabilities, metadata ---
@@ -5636,9 +5631,7 @@ async def test_agent_realtime_session_additional_toolsets() -> None:
 
 async def test_agent_realtime_session_external_usage_accumulates() -> None:
     usage = RunUsage()
-    conn = FakeRealtimeConnection(
-        [SessionUsageEvent(usage=RequestUsage(input_tokens=7, output_tokens=3)), ResponseDone()]
-    )
+    conn = FakeRealtimeConnection([SessionUsage(usage=RequestUsage(input_tokens=7, output_tokens=3)), ResponseDone()])
     model = FakeRealtimeModel(conn)
     agent: Agent[None, str] = Agent()
     async with agent.realtime(model, usage=usage).session() as session:
@@ -5656,7 +5649,7 @@ async def test_run_level_usage_is_not_attributed_to_or_finalize_response() -> No
         [
             OutputTranscript(text='first response', is_final=True),
             ToolCall(tool_call_id='pending', tool_name='noop', args='{}', response_usage_follows=True),
-            SessionUsageEvent(usage=RequestUsage(details={'input_transcription_seconds': 3}), response_scoped=False),
+            SessionUsage(usage=RequestUsage(details={'input_transcription_seconds': 3}), response_scoped=False),
             OutputTranscript(text='second response', is_final=True),
             ResponseDone(),
         ]
@@ -5673,7 +5666,7 @@ async def test_run_level_usage_is_not_attributed_to_or_finalize_response() -> No
 
 async def test_agent_realtime_session_token_limit_raises() -> None:
     conn = FakeRealtimeConnection(
-        [SessionUsageEvent(usage=RequestUsage(input_tokens=100, output_tokens=100)), ResponseDone()]
+        [SessionUsage(usage=RequestUsage(input_tokens=100, output_tokens=100)), ResponseDone()]
     )
     model = FakeRealtimeModel(conn)
     agent: Agent[None, str] = Agent()
@@ -5683,7 +5676,7 @@ async def test_agent_realtime_session_token_limit_raises() -> None:
 
 
 async def test_agent_realtime_session_cost_limit_raises_on_usage() -> None:
-    conn = FakeRealtimeConnection([SessionUsageEvent(usage=RequestUsage(cost=Decimal('0.51'))), ResponseDone()])
+    conn = FakeRealtimeConnection([SessionUsage(usage=RequestUsage(cost=Decimal('0.51'))), ResponseDone()])
     agent: Agent[None, str] = Agent()
     async with agent.realtime(
         FakeRealtimeModel(conn), usage_limits=UsageLimits(cost_limit=Decimal('0.50'))
@@ -5708,7 +5701,7 @@ async def test_when_idle_enqueue_after_pump_finishes_is_delivered() -> None:
                 break
             await asyncio.sleep(0)
 
-    assert conn.sent == [TextInput('late idle message')]
+    assert conn.sent == ['late idle message']
 
 
 def test_finalized_response_terminal_does_not_begin_another_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5728,7 +5721,7 @@ def test_finalized_response_terminal_does_not_begin_another_response(monkeypatch
 
 async def test_agent_realtime_session_per_request_input_token_limit_raises() -> None:
     conn = FakeRealtimeConnection(
-        [SessionUsageEvent(usage=RequestUsage(input_tokens=51), response_scoped=True), ResponseDone()]
+        [SessionUsage(usage=RequestUsage(input_tokens=51), response_scoped=True), ResponseDone()]
     )
     agent: Agent[None, str] = Agent()
     async with agent.realtime(
@@ -5741,10 +5734,10 @@ async def test_agent_realtime_session_per_request_input_token_limit_raises() -> 
 async def test_agent_realtime_session_request_limit_raises() -> None:
     conn = FakeRealtimeConnection(
         [
-            SessionUsageEvent(usage=RequestUsage(input_tokens=1, output_tokens=1)),
+            SessionUsage(usage=RequestUsage(input_tokens=1, output_tokens=1)),
             OutputTranscript(text='first', is_final=True),
             ResponseDone(),
-            SessionUsageEvent(usage=RequestUsage(input_tokens=1, output_tokens=1)),
+            SessionUsage(usage=RequestUsage(input_tokens=1, output_tokens=1)),
             OutputTranscript(text='second', is_final=True),
             ResponseDone(),
         ]
@@ -5827,7 +5820,7 @@ async def test_agent_realtime_session_usage_limits_within_budget() -> None:
 
     conn = FakeRealtimeConnection(
         [
-            SessionUsageEvent(usage=RequestUsage(input_tokens=1, output_tokens=1)),
+            SessionUsage(usage=RequestUsage(input_tokens=1, output_tokens=1)),
             ToolCall(tool_call_id='t1', tool_name='greet', args='{}'),
             ResponseDone(),
         ]

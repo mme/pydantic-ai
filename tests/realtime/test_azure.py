@@ -18,7 +18,6 @@ with try_import() as imports_successful:
     from pydantic_ai.providers.azure import AzureProvider
     from pydantic_ai.providers.openai import OpenAIProvider
     from pydantic_ai.realtime import RealtimeSessionErrorEvent, TurnDetection
-    from pydantic_ai.realtime._base import OutputTranscript
     from pydantic_ai.realtime.azure import (
         AzureRealtimeConnection,
         AzureRealtimeModel,
@@ -27,6 +26,7 @@ with try_import() as imports_successful:
         ServerVAD,
         _map_voice_live_event,  # pyright: ignore[reportPrivateUsage]
     )
+    from pydantic_ai.realtime.codec import OutputTranscript
 
 pytestmark = pytest.mark.skipif(not imports_successful(), reason='openai / websockets not installed')
 
@@ -49,7 +49,7 @@ def test_model_is_not_exported_from_the_realtime_package() -> None:
 
 
 def test_default_provider() -> None:
-    assert AzureRealtimeModel().system == 'azure'
+    assert AzureRealtimeModel('gpt-realtime').system == 'azure'
 
 
 def test_non_azure_provider_instance_is_rejected() -> None:
@@ -98,7 +98,7 @@ def test_voice_live_session_config_options() -> None:
     model = AzureRealtimeModel('phi-4-mm-realtime', provider=provider)
     settings = AzureRealtimeModelSettings(
         azure_voice_live=True,
-        azure_voice_live_turn_detection=ServerVAD(silence_duration_ms=750),
+        azure_voice_live_turn_detection=ServerVAD(type='server_vad', silence_duration_ms=750),
         input_transcription_model=None,
         openai_voice='alloy',
         max_tokens=123,
@@ -108,7 +108,7 @@ def test_voice_live_session_config_options() -> None:
     config = model._session_config(  # pyright: ignore[reportPrivateUsage]
         'Be concise.',
         [ToolDefinition(name='lookup', parameters_json_schema={'type': 'object'})],
-        settings,
+        model_settings=settings,
     )
 
     assert config['turn_detection']['silence_duration_ms'] == 750
@@ -119,7 +119,11 @@ def test_voice_live_session_config_options() -> None:
     assert config['tools'][0]['name'] == 'lookup'
 
     config = model._session_config(  # pyright: ignore[reportPrivateUsage]
-        '', None, AzureRealtimeModelSettings(azure_voice_live=True, turn_detection=TurnDetection(sensitivity='high'))
+        '',
+        None,
+        model_settings=AzureRealtimeModelSettings(
+            azure_voice_live=True, turn_detection=TurnDetection(sensitivity='high')
+        ),
     )
     assert config['turn_detection']['threshold'] == 0.3
     assert config['input_audio_transcription'] == {'model': 'azure-speech'}
@@ -136,7 +140,7 @@ def test_voice_live_rejects_openai_custom_voice_id() -> None:
     settings = AzureRealtimeModelSettings(azure_voice_live=True, openai_voice=VoiceID(id='voice_custom'))
 
     with pytest.raises(UserError, match='does not accept an OpenAI custom `VoiceID`'):
-        model._session_config('Be concise.', None, settings)  # pyright: ignore[reportPrivateUsage]
+        model._session_config('Be concise.', None, model_settings=settings)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.anyio
@@ -278,12 +282,12 @@ def test_voice_live_silently_ignores_openai_only_settings() -> None:
     config = model._session_config(  # pyright: ignore[reportPrivateUsage]
         'hi',
         None,
-        AzureRealtimeModelSettings(
+        model_settings=AzureRealtimeModelSettings(
             azure_voice_live=True,
             openai_output_speed=1.5,
             openai_input_noise_reduction='near_field',
             openai_truncation='auto',
-            openai_turn_detection=SemanticVAD(eagerness='high'),
+            openai_turn_detection=SemanticVAD(type='semantic_vad', eagerness='high'),
             thinking='low',
             parallel_tool_calls=False,
         ),
@@ -350,11 +354,11 @@ def test_profile_override_corrects_a_deployment_name(monkeypatch: pytest.MonkeyP
 
     inferred = AzureRealtimeModel('voice-prod', settings={'thinking': 'low'})
     assert inferred.profile.get('supports_thinking') is False
-    assert 'reasoning' not in inferred._session_config('', None, None)  # pyright: ignore[reportPrivateUsage]
+    assert 'reasoning' not in inferred._session_config('', None, model_settings=None)  # pyright: ignore[reportPrivateUsage]
 
     corrected = AzureRealtimeModel('voice-prod', settings={'thinking': 'low'}, profile={'supports_thinking': True})
     assert corrected.profile.get('supports_thinking') is True
-    assert corrected._session_config('', None, None)['reasoning'] == {'effort': 'low'}  # pyright: ignore[reportPrivateUsage]
+    assert corrected._session_config('', None, model_settings=None)['reasoning'] == {'effort': 'low'}  # pyright: ignore[reportPrivateUsage]
     # Everything the provider said is still there — `profile=` is a layer, not a replacement.
     assert corrected.profile.get('supports_image_input') is True
 

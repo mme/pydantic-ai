@@ -19,11 +19,13 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import ModelAPIError, UserError
 from pydantic_ai.messages import (
+    BinaryAudio,
     BinaryContent,
     ImageUrl,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RealtimeSessionErrorEvent,
     SpeechPart,
     TextPart,
     UserPromptPart,
@@ -33,16 +35,16 @@ from pydantic_ai.native_tools import WebSearchTool
 from pydantic_ai.realtime import (
     RealtimeModelProfile,
     RealtimeSessionReconnectEvent,
-    TurnDetection,
-    WebRTCSession,
 )
-from pydantic_ai.realtime._base import ConversationCreated, ConversationItemCreated, RealtimeSessionErrorEvent
 from pydantic_ai.realtime.codec import (
     AudioDelta,
+    ConversationCreated,
+    ConversationItemCreated,
     InputTranscript,
     OutputTranscript,
-    SessionUsageEvent,
+    SessionUsage,
     ToolCall,
+    ToolResult,
 )
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage
@@ -56,9 +58,15 @@ with try_import() as imports_successful:
     from pydantic_ai.providers.openai import OpenAIProvider
     from pydantic_ai.providers.xai import XaiProvider
     from pydantic_ai.realtime import xai as rt_xai
-    from pydantic_ai.realtime.xai import XaiRealtimeConnection, XaiRealtimeModel, map_event
+    from pydantic_ai.realtime.xai import XaiRealtimeConnection, XaiRealtimeModel, map_event as _map_wire_event
+
+from .test_openai import sdk_frame
 
 pytestmark = pytest.mark.skipif(not imports_successful(), reason='xai-sdk / websockets not installed')
+
+
+def map_event(frame: dict[str, Any]) -> object:
+    return _map_wire_event(sdk_frame(frame))
 
 
 def test_xai_public_exports_are_curated() -> None:
@@ -71,14 +79,23 @@ def test_xai_public_exports_are_curated() -> None:
 
 
 def _model(settings: rt_xai.XaiRealtimeModelSettings | None = None, **kwargs: Any) -> XaiRealtimeModel:
-    return XaiRealtimeModel(provider=XaiProvider(api_key='k'), settings=settings, **kwargs)
+    model = kwargs.pop('model', 'grok-voice-latest')
+    return XaiRealtimeModel(model, provider=XaiProvider(api_key='k'), settings=settings, **kwargs)
 
 
 def test_realtime_rejects_custom_api_host() -> None:
     """A custom `api_host` sets the gRPC channel target, which the realtime WebSocket can't honor (it
     derives its URL from `base_url`), so construction fails loudly rather than dialing the wrong host."""
     with pytest.raises(UserError, match='does not support a custom `api_host`'):
-        XaiRealtimeModel(provider=XaiProvider(api_key='k', api_host='grpc.custom.example.com'))
+        XaiRealtimeModel('grok-voice-latest', provider=XaiProvider(api_key='k', api_host='grpc.custom.example.com'))
+
+
+async def test_connection_send_audio_rejects_non_pcm_media_type() -> None:
+    ws = FakeWebSocket([])
+    conn = XaiRealtimeConnection(ws)  # type: ignore[arg-type]
+    with pytest.raises(UserError, match='require raw PCM audio'):
+        await conn.send(BinaryAudio(data=b'RIFF', media_type='audio/wav'))
+    assert ws.sent == []
 
 
 def _connect(
@@ -118,7 +135,11 @@ def test_map_input_transcription_updated_is_a_cumulative_partial() -> None:
 )
 def test_map_input_transcription_updated_tolerates_a_thin_frame(frame: dict[str, Any], expected: object) -> None:
     """The `.updated` frame has no SDK model behind it, so it is read defensively off the wire."""
-    assert map_event({'type': 'conversation.item.input_audio_transcription.updated', **frame}) == expected
+    if frame.get('item_id') == 7:
+        with pytest.raises(ValueError):
+            map_event({'type': 'conversation.item.input_audio_transcription.updated', **frame})
+    else:
+        assert map_event({'type': 'conversation.item.input_audio_transcription.updated', **frame}) == expected
 
 
 def test_map_input_transcription_completed_delegates_to_openai_codec() -> None:
@@ -218,9 +239,26 @@ def test_connection_map_event_override_matches_module() -> None:
     assert conn._map_event(  # pyright: ignore[reportPrivateUsage]
         {'type': 'conversation.item.input_audio_transcription.updated', 'transcript': 'x'}
     ) == InputTranscript(text='x', cumulative=True)
-    assert conn._map_event({'type': 'response.output_audio_transcript.delta', 'delta': 'hi'}) == OutputTranscript(  # pyright: ignore[reportPrivateUsage]
-        text='hi', is_final=False
-    )
+    assert conn._map_event(  # pyright: ignore[reportPrivateUsage]
+        sdk_frame({'type': 'response.output_audio_transcript.delta', 'delta': 'hi'})
+    ) == OutputTranscript(text='hi', is_final=False)
+
+
+@pytest.mark.anyio
+async def test_connection_send_tool_result_image_raises_with_nothing_sent() -> None:
+    """Grok Voice has no image input, so an image attached to a tool result raises before any frame
+    goes out — instead of the shared codec's follow-up user message — rather than degrading silently."""
+    ws = FakeWebSocket([])
+    conn = XaiRealtimeConnection(ws)  # type: ignore[arg-type]
+    with pytest.raises(UserError, match='xai realtime sessions do not support images'):
+        await conn.send(
+            ToolResult(
+                tool_call_id='call_1',
+                output='See file result.png.',
+                content=['This is file result.png:', BinaryContent(data=b'png', media_type='image/png')],
+            )
+        )
+    assert ws.sent == []
 
 
 # --- capabilities --------------------------------------------------------------------------------
@@ -241,27 +279,11 @@ def test_profile() -> None:
         supports_thinking=True,
         supports_async_tool_calls=False,
         supports_tool_return_schema=False,
+        emits_input_speech_events=True,
         audio_input_sample_rate=24000,
         audio_output_sample_rate=24000,
         supported_native_tools=frozenset(),
     )
-
-
-async def test_webrtc_entry_points_are_unsupported() -> None:
-    model = _model()
-    error = rf'Realtime model {model.model_name!r} does not support WebRTC.*connect over WebSockets'
-    with pytest.raises(UserError, match=error):
-        await model.answer_webrtc_offer('offer')
-    with pytest.raises(UserError, match=error):
-        await model.create_client_secret()
-    with pytest.raises(UserError, match=error):
-        async with model.connect_webrtc(
-            WebRTCSession(provider_name='xai', session_id='x'),
-            messages=[],
-            model_settings=None,
-            model_request_parameters=ModelRequestParameters(),
-        ):
-            pass  # pragma: no cover - raises before yielding
 
 
 # --- session config: xAI's shape diverges from OpenAI's GA surface -------------------------------
@@ -271,7 +293,7 @@ def test_session_config_shape() -> None:
     """`xai_voice` maps to top-level `voice`, alongside `turn_detection`, in xAI's session shape."""
     model = _model(rt_xai.XaiRealtimeModelSettings(xai_voice='ara'))
     tools = [ToolDefinition(name='get_weather', description='Weather', parameters_json_schema={'type': 'object'})]
-    config = model._session_config('Be nice', tools, None)  # pyright: ignore[reportPrivateUsage]
+    config = model._session_config('Be nice', tools, model_settings=None)  # pyright: ignore[reportPrivateUsage]
     assert config == {
         'instructions': 'Be nice',
         'turn_detection': {'type': 'server_vad', 'create_response': True, 'interrupt_response': True},
@@ -289,10 +311,23 @@ def test_session_config_shape() -> None:
     }
 
 
+def test_session_config_uses_profile_sample_rates() -> None:
+    model = _model(profile=RealtimeModelProfile(audio_input_sample_rate=16000, audio_output_sample_rate=32000))
+
+    config = model._session_config('', None, model_settings=None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config['audio']['input']['format']['rate'] == 16000
+    assert config['audio']['output']['format']['rate'] == 32000
+
+
 def test_session_config_resumption_follows_reconnect_policy() -> None:
-    assert 'resumption' not in _model()._session_config('hi', None, None)  # pyright: ignore[reportPrivateUsage]
-    config = _model(reconnect=rt_xai.ReconnectPolicy())._session_config('hi', None, None)  # pyright: ignore[reportPrivateUsage]
-    assert config['resumption'] == {'enabled': True}
+    assert 'resumption' not in _model()._session_config('hi', None, model_settings=None)  # pyright: ignore[reportPrivateUsage]
+    # A model-level default policy (via `settings=`) enables native resumption...
+    model_level = _model(rt_xai.XaiRealtimeModelSettings(reconnect={}))
+    assert model_level._session_config('hi', None, model_settings=None)['resumption'] == {'enabled': True}  # pyright: ignore[reportPrivateUsage]
+    # ...and so does a per-session policy on a model with no defaults.
+    per_session = rt_xai.XaiRealtimeModelSettings(reconnect={})
+    assert _model()._session_config('hi', None, model_settings=per_session)['resumption'] == {'enabled': True}  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
@@ -308,7 +343,7 @@ def test_session_config_resumption_follows_reconnect_policy() -> None:
 def test_session_config_thinking(model_name: str, thinking: object, expected: str) -> None:
     model = _model(model=model_name)
     settings = rt_xai.XaiRealtimeModelSettings(thinking=thinking)  # type: ignore[typeddict-item]
-    config = model._session_config('hi', None, settings)  # pyright: ignore[reportPrivateUsage]
+    config = model._session_config('hi', None, model_settings=settings)  # pyright: ignore[reportPrivateUsage]
     assert config['reasoning'] == {'effort': expected}
     assert model.profile.get('supports_thinking') is True
 
@@ -316,7 +351,7 @@ def test_session_config_thinking(model_name: str, thinking: object, expected: st
 def test_session_config_thinking_is_ignored_by_legacy_model() -> None:
     model = _model(model='grok-voice-fast-1.0')
     config = model._session_config(  # pyright: ignore[reportPrivateUsage]
-        'hi', None, rt_xai.XaiRealtimeModelSettings(thinking='high')
+        'hi', None, model_settings=rt_xai.XaiRealtimeModelSettings(thinking='high')
     )
     assert 'reasoning' not in config
     assert model.profile.get('supports_thinking') is False
@@ -326,14 +361,14 @@ def test_session_config_transcription_auto_by_default() -> None:
     """The default `input_transcription_model='auto'` resolves to xAI's recommended transcription model
     (`grok-transcribe`) → `audio.input.transcription.model`, so the user's audio turns are transcribed
     into history under the default `transcript_only` retention (they'd otherwise be dropped)."""
-    config = _model()._session_config('hi', None, None)  # pyright: ignore[reportPrivateUsage]
+    config = _model()._session_config('hi', None, model_settings=None)  # pyright: ignore[reportPrivateUsage]
     assert config['audio']['input']['transcription'] == {'model': 'grok-transcribe'}
 
 
 def test_session_config_transcription_explicit_override() -> None:
     """An explicit model id is used verbatim, overriding the `'auto'` default."""
     config = _model()._session_config(  # pyright: ignore[reportPrivateUsage]
-        'hi', None, rt_xai.XaiRealtimeModelSettings(input_transcription_model='grok-transcribe-next')
+        'hi', None, model_settings=rt_xai.XaiRealtimeModelSettings(input_transcription_model='grok-transcribe-next')
     )
     assert config['audio']['input']['transcription'] == {'model': 'grok-transcribe-next'}
 
@@ -341,7 +376,7 @@ def test_session_config_transcription_explicit_override() -> None:
 def test_session_config_transcription_disabled() -> None:
     """`input_transcription_model=None` opts out of transcription."""
     config = _model()._session_config(  # pyright: ignore[reportPrivateUsage]
-        'hi', None, rt_xai.XaiRealtimeModelSettings(input_transcription_model=None)
+        'hi', None, model_settings=rt_xai.XaiRealtimeModelSettings(input_transcription_model=None)
     )
     assert 'transcription' not in config['audio']['input']
 
@@ -349,7 +384,7 @@ def test_session_config_transcription_disabled() -> None:
 def test_session_config_manual_turn_detection_is_null() -> None:
     """`turn_detection=False` disables VAD (push-to-talk), sent as an explicit null."""
     config = _model()._session_config(  # pyright: ignore[reportPrivateUsage]
-        'hi', None, rt_xai.XaiRealtimeModelSettings(turn_detection=False)
+        'hi', None, model_settings=rt_xai.XaiRealtimeModelSettings(turn_detection=False)
     )
     assert config['turn_detection'] is None
 
@@ -361,7 +396,7 @@ def test_session_config_cross_provider_turn_detection_sensitivity(
     config = _model()._session_config(  # pyright: ignore[reportPrivateUsage]
         'hi',
         None,
-        rt_xai.XaiRealtimeModelSettings(turn_detection=TurnDetection(sensitivity=sensitivity)),
+        model_settings=rt_xai.XaiRealtimeModelSettings(turn_detection={'sensitivity': sensitivity}),
     )
     assert config['turn_detection']['threshold'] == threshold
 
@@ -370,9 +405,9 @@ def test_session_config_xai_turn_detection_overrides_base() -> None:
     config = _model()._session_config(  # pyright: ignore[reportPrivateUsage]
         'hi',
         None,
-        rt_xai.XaiRealtimeModelSettings(
-            turn_detection=TurnDetection(sensitivity='high'),
-            xai_turn_detection=rt_xai.ServerVAD(threshold=0.9, create_response=False),
+        model_settings=rt_xai.XaiRealtimeModelSettings(
+            turn_detection={'sensitivity': 'high'},
+            xai_turn_detection={'type': 'server_vad', 'threshold': 0.9, 'create_response': False},
         ),
     )
     assert config['turn_detection'] == {
@@ -385,7 +420,7 @@ def test_session_config_xai_turn_detection_overrides_base() -> None:
 
 def test_session_config_no_voice_by_default() -> None:
     """Without an explicit voice, none is sent and the server default (`eve`) applies."""
-    assert 'voice' not in _model()._session_config('hi', None, None)  # pyright: ignore[reportPrivateUsage]
+    assert 'voice' not in _model()._session_config('hi', None, model_settings=None)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_session_config_forwards_model_settings() -> None:
@@ -393,7 +428,7 @@ def test_session_config_forwards_model_settings() -> None:
     model = _model(settings=settings)
     assert model.settings == settings
     tools = [ToolDefinition(name='get_weather', parameters_json_schema={'type': 'object'})]
-    config = model._session_config('hi', tools, settings)  # pyright: ignore[reportPrivateUsage]
+    config = model._session_config('hi', tools, model_settings=settings)  # pyright: ignore[reportPrivateUsage]
     assert config['max_output_tokens'] == 256
     assert config['parallel_tool_calls'] is False
     assert config['tool_choice'] == 'required'
@@ -401,7 +436,7 @@ def test_session_config_forwards_model_settings() -> None:
 
 def test_session_config_omits_absent_model_settings() -> None:
     """Absent realtime settings are omitted from the session config."""
-    config = _model()._session_config('hi', None, rt_xai.XaiRealtimeModelSettings())  # pyright: ignore[reportPrivateUsage]
+    config = _model()._session_config('hi', None, model_settings=rt_xai.XaiRealtimeModelSettings())  # pyright: ignore[reportPrivateUsage]
     assert 'max_output_tokens' not in config
     assert 'parallel_tool_calls' not in config
     assert 'tool_choice' not in config
@@ -421,8 +456,13 @@ class FakeWebSocket:
     close_reason: str = ''
 
     def __init__(self, incoming: list[Any]) -> None:
-        self._incoming = list(incoming)
+        self._incoming = [self._normalize_frame(frame) for frame in incoming]
         self.sent: list[str] = []
+
+    @staticmethod
+    def _normalize_frame(frame: str) -> str:
+        data = json.loads(frame)
+        return json.dumps(sdk_frame(cast('dict[str, Any]', data))) if isinstance(data, dict) else frame
 
     async def recv(self) -> Any:
         return self._incoming.pop(0)
@@ -454,7 +494,7 @@ async def test_response_done_maps_xai_usage_extras() -> None:
     conn = XaiRealtimeConnection(FakeWebSocket([done]))  # type: ignore[arg-type]
     events = await collect_codec_events(conn)
 
-    assert events[0] == SessionUsageEvent(
+    assert events[0] == SessionUsage(
         usage=RequestUsage(
             input_tokens=8,
             output_tokens=5,
@@ -704,7 +744,7 @@ async def test_connect_rejects_seeded_image(monkeypatch: pytest.MonkeyPatch, ima
     )
     history = [ModelRequest(parts=[UserPromptPart(content=[image])])]
 
-    with pytest.raises(UserError, match='xai realtime history seeding does not support images'):
+    with pytest.raises(UserError, match='xai realtime sessions do not support images'):
         async with _connect(_model(), 'x', messages=history):
             pass  # pragma: no cover
 
@@ -731,7 +771,7 @@ async def test_connect_reconnect_closes_previous_connection(monkeypatch: pytest.
     connect = _RecordingConnect([dropped, good])
     monkeypatch.setattr(rt_xai.websockets, 'connect', connect)
 
-    model = _model(reconnect=rt_xai.ReconnectPolicy(base_delay=0.0, max_attempts=1))
+    model = _model(rt_xai.XaiRealtimeModelSettings(reconnect={'base_delay': 0.0, 'max_attempts': 1}))
     async with _connect(model, 'x') as conn:
         events = await collect_codec_events(conn)
 
@@ -804,7 +844,7 @@ async def test_reconnect_replay_burst_is_deduplicated_from_session_history(
     monkeypatch.setattr(rt_xai.websockets, 'connect', _RecordingConnect([dropped, resumed]))
 
     agent = Agent()
-    model = _model(reconnect=rt_xai.ReconnectPolicy(base_delay=0.0, max_attempts=1))
+    model = _model(rt_xai.XaiRealtimeModelSettings(reconnect={'base_delay': 0.0, 'max_attempts': 1}))
     async with agent.realtime(model).session() as session:
         await session.send('Hello.')
         events = await collect_session_events(session)
@@ -820,8 +860,6 @@ async def test_reconnect_replay_burst_is_deduplicated_from_session_history(
         SpeechPart(
             speaker='assistant',
             transcript='Hello back.',
-            id='item-assistant',
-            provider_name='xai',
         )
     ]
 
@@ -861,7 +899,7 @@ async def test_connect_reconnect_failure_leaves_nothing_to_close(monkeypatch: py
 
     connect = _DropThenFail()
     monkeypatch.setattr(rt_xai.websockets, 'connect', connect)
-    model = _model(reconnect=rt_xai.ReconnectPolicy(max_attempts=1, base_delay=0.0, jitter=False))
+    model = _model(rt_xai.XaiRealtimeModelSettings(reconnect={'max_attempts': 1, 'base_delay': 0.0, 'jitter': False}))
     async with _connect(model, 'x') as conn:
         events = [e async for e in conn]
 
@@ -912,7 +950,7 @@ async def test_connect_rejects_conversation_created_without_id(monkeypatch: pyte
     monkeypatch.setattr(rt_xai.websockets, 'connect', FakeConnect(ws))
 
     with pytest.raises(RuntimeError, match=r'did not include a `conversation\.id`'):
-        async with _connect(_model(reconnect=rt_xai.ReconnectPolicy()), 'x'):
+        async with _connect(_model(rt_xai.XaiRealtimeModelSettings(reconnect={})), 'x'):
             pass  # pragma: no cover
 
 
@@ -927,7 +965,7 @@ async def test_provider_str_resolves_key_from_env(monkeypatch: pytest.MonkeyPatc
     fake_connect = FakeConnect(ws)
     monkeypatch.setattr(rt_xai.websockets, 'connect', fake_connect)
 
-    model = XaiRealtimeModel()
+    model = XaiRealtimeModel('grok-voice-latest')
     assert model.model_name == 'grok-voice-latest'
     async with _connect(model, 'hi'):
         pass
@@ -975,4 +1013,4 @@ def test_provider_from_xai_client_without_exposed_key_raises() -> None:
     """A provider built from a pre-configured `xai_client` can't expose its key, so realtime errors clearly."""
     provider = XaiProvider(xai_client=AsyncClient(api_key='hidden'))
     with pytest.raises(UserError, match='pre-configured `xai_client`'):
-        XaiRealtimeModel(provider=provider)
+        XaiRealtimeModel('grok-voice-latest', provider=provider)

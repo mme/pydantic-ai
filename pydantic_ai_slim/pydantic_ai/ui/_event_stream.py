@@ -31,6 +31,8 @@ from ..messages import (
     RealtimeInputSpeechEndEvent,
     RealtimeInputSpeechStartEvent,
     RealtimeInputTranscriptionErrorEvent,
+    RealtimeOutputSpeechEndEvent,
+    RealtimeOutputSpeechStartEvent,
     RealtimeResponseInterruptedEvent,
     RealtimeSessionErrorEvent,
     RealtimeSessionReconnectEvent,
@@ -435,11 +437,15 @@ class UIEventStream(ABC, Generic[RunInputT, EventT, AgentDepsT, OutputDataT]):
                 RealtimeTurnCompleteEvent()
                 | RealtimeInputSpeechStartEvent()
                 | RealtimeInputSpeechEndEvent()
+                | RealtimeOutputSpeechStartEvent()
+                | RealtimeOutputSpeechEndEvent()
                 | RealtimeResponseInterruptedEvent()
                 | RealtimeInputTranscriptionErrorEvent()
                 | RealtimeSessionReconnectEvent()
                 | RealtimeSessionErrorEvent()
             ):  # pragma: no cover
+                # This spells out `RealtimeSessionEvent`: class patterns cannot reference a union alias,
+                # and a guarded `isinstance` arm prevents pyright from proving this match exhaustive.
                 # Realtime session events don't flow through UI event streams.
                 pass
             case _:
@@ -485,7 +491,7 @@ class UIEventStream(ABC, Generic[RunInputT, EventT, AgentDepsT, OutputDataT]):
             case FilePart():
                 async for e in self.handle_file(part):
                     yield e
-            case CompactionPart():  # pragma: no cover
+            case CompactionPart():  # pragma: no branch
                 async for e in self.handle_compaction(part):
                     yield e
             case SpeechPart():  # pragma: no cover
@@ -553,7 +559,7 @@ class UIEventStream(ABC, Generic[RunInputT, EventT, AgentDepsT, OutputDataT]):
             case NativeToolCallPart():
                 async for e in self.handle_builtin_tool_call_end(part):
                     yield e
-            case NativeToolReturnPart() | FilePart() | CompactionPart():  # pragma: no cover
+            case NativeToolReturnPart() | FilePart() | CompactionPart():
                 # These don't have deltas, so they don't need to be ended.
                 pass
             case SpeechPart():  # pragma: no cover

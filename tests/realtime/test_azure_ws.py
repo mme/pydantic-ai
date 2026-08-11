@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
     ModelRequest,
     ModelResponse,
+    RealtimeSessionErrorEvent,
     SpeechPart,
     TextPart,
     ToolCallPart,
@@ -24,7 +25,6 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.realtime import RealtimeTurnCompleteEvent
-from pydantic_ai.realtime._base import RealtimeSessionErrorEvent
 from pydantic_ai.usage import RunUsage
 
 from ..conftest import IsDatetime, IsStr, try_import
