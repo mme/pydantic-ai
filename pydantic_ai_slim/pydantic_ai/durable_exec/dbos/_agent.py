@@ -1175,9 +1175,12 @@ class DBOSAgent(WrapperAgent[AgentDepsT, OutputDataT], DBOSConfiguredInstance):
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
         usage: _usage.RunUsage | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
         metadata: AgentMetadata[AgentDepsT] | None = None,
         conversation_id: str | None = None,
+        run_id: str | None = None,
         message_history: Sequence[_messages.ModelMessage] | None = None,
+        run_lifecycle: bool = False,
     ) -> AsyncGenerator[_RealtimeSessionResolution[AgentDepsT]]:
         """Resolve realtime configuration; backs the browser-call signaling helpers.
 
@@ -1200,9 +1203,12 @@ class DBOSAgent(WrapperAgent[AgentDepsT, OutputDataT], DBOSConfiguredInstance):
             toolsets=toolsets,
             capabilities=capabilities,
             usage=usage,
+            usage_limits=usage_limits,
             metadata=metadata,
             conversation_id=conversation_id,
+            run_id=run_id,
             message_history=message_history,
+            run_lifecycle=run_lifecycle,
         ) as resolved:
             yield resolved
 
