@@ -26,13 +26,9 @@ import wave
 
 import logfire
 
-from pydantic_ai import Agent
-from pydantic_ai.realtime import (
-    PartDeltaEvent,
-    RealtimeTurnCompleteEvent,
-    SpeechPartDelta,
-)
-from pydantic_ai.realtime.openai import OpenAIRealtimeModel, OpenAIRealtimeModelSettings
+from pydantic_ai import Agent, PartDeltaEvent, SpeechPartDelta
+from pydantic_ai.realtime import RealtimeTurnCompleteEvent
+from pydantic_ai.realtime.openai import OpenAIRealtimeModelSettings
 
 # 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
 logfire.configure(send_to_logfire='if-token-present')
@@ -62,7 +58,7 @@ async def main(prompt: str, output_path: str) -> None:
     audio = bytearray()
 
     async with agent.realtime(
-        OpenAIRealtimeModel('gpt-realtime'),
+        'openai:gpt-realtime',
         model_settings=OpenAIRealtimeModelSettings(openai_voice='marin'),
     ).session() as session:
         # Sending text (rather than audio) into an OpenAI realtime session asks the model to respond

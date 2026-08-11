@@ -1561,7 +1561,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         initial_ctx.metadata = state.metadata
 
         # Resolve the capability layers and extract their per-run contributions. Shared with
-        # `_open_realtime_session` via `_resolve_run_capabilities` so both wire capabilities up identically;
+        # `realtime_session` via `_resolve_run_capabilities` so both wire capabilities up identically;
         # this call site keeps the graph-only surroundings: the `InstrumentedModel` unwrap and
         # instrumentation-settings resolution above, the deferred loader (`inject_deferred_loader=True`),
         # the output toolset below, and the layered `get_model_settings` closure. Keep those in sync
@@ -1590,7 +1590,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             resolved_layers[model_layer_start + index] is layer for index, layer in enumerate(model_layers)
         )
 
-        # Build model settings resolver using per-run capability. Shared with `_open_realtime_session` via
+        # Build model settings resolver using per-run capability. Shared with `realtime_session` via
         # `_layer_model_settings` (agent -> capability -> run order; the model's own settings are the
         # base for a graph run). Resolved per model-request step here; once at connect in a session.
         def get_model_settings(run_context: RunContext[AgentDepsT]) -> ModelSettings | None:
@@ -2733,7 +2733,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
     def _base_run_capability(self) -> tuple[CombinedCapability[AgentDepsT], bool]:
         """The base capability layer for a run, plus whether it came from `override(root_capability=...)`.
 
-        `iter` and `_open_realtime_session` both resolve the base layer through this so the override is honored
+        `iter` and `realtime_session` both resolve the base layer through this so the override is honored
         identically — KEEP the two call sites in sync (a realtime session that ignored the override would
         silently drop a `with agent.override(root_capability=...):` block).
         """
@@ -2746,7 +2746,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         """Bind per-run capabilities to this agent via `for_agent` before capability resolution.
 
         `_resolve_run_capabilities` only ever calls `for_run`, so binding the per-run layer via
-        `for_agent` is the caller's responsibility. `iter` and `_open_realtime_session` both MUST call this —
+        `for_agent` is the caller's responsibility. `iter` and `realtime_session` both MUST call this —
         skipping it uses a capability that overrides `for_agent` (e.g. the durability capabilities)
         unbound, a silent divergence. KEEP the two call sites in sync.
         """
@@ -2865,7 +2865,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         """Resolve the per-run capability layers and extract their contributions.
 
         Shared by [`iter`][pydantic_ai.agent.AbstractAgent.iter] / [`run`][pydantic_ai.agent.AbstractAgent.run]
-        and [`_open_realtime_session`][pydantic_ai.agent.Agent.realtime] so both wire capabilities up
+        and [`realtime_session`][pydantic_ai.agent.Agent.realtime_session] so both wire capabilities up
         identically: the outermost `Instrumentation` injection, per-layer `for_run` resolution (never
         composing first — see below), optional deferred-loader injection, and the native-tool /
         instruction / model-settings / toolset contributions with `override(native_tools=...)` folded
@@ -3524,7 +3524,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
         # A WebRTC sideband session doesn't own the audio transport: the browser streams audio to the
         # provider directly, so the session disables its audio methods and retains no audio bytes.
         owns_media = provider_session is None
-        if provider_session is not None and audio_retention != 'transcript_only':
+        if not owns_media and audio_retention != 'transcript_only':
             # Reject an audio-retention request that can never be satisfied (no audio bytes flow here).
             raise exceptions.UserError(
                 "A WebRTC sideband session can't retain audio: the browser exchanges audio with the "
@@ -3566,12 +3566,11 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
 
                 session = RealtimeSession(
                     _SkippedRealtimeConnection(),
-                    resolved.tool_manager,
-                    model_name=resolved.model.model_name,
+                    model=resolved.model,
+                    tool_manager=resolved.tool_manager,
                     usage=resolved.run_context.usage,
                     usage_limits=usage_limits,
                     message_history=message_history,
-                    profile=resolved.model_profile,
                     conversation_id=resolved.conversation_id,
                     run_id=resolved.run_id,
                     metadata=resolved.run_context.metadata,
@@ -3599,27 +3598,27 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     '`SpeechPart` instead.'
                 )
 
-            if provider_session is not None:
-                connection_manager = resolved.model.connect_webrtc(
+            connection_manager = (
+                resolved.model.connect(
+                    messages=resolved.request_messages,
+                    model_settings=resolved.model_settings,
+                    model_request_parameters=resolved.model_request_parameters,
+                )
+                if provider_session is None
+                else resolved.model.connect_webrtc(
                     provider_session,
                     messages=resolved.request_messages,
                     model_settings=resolved.model_settings,
                     model_request_parameters=resolved.model_request_parameters,
                 )
-            else:
-                connection_manager = resolved.model.connect(
-                    messages=resolved.request_messages,
-                    model_settings=resolved.model_settings,
-                    model_request_parameters=resolved.model_request_parameters,
-                )
+            )
             async with connection_manager as connection:
                 session = RealtimeSession(
                     connection,
-                    resolved.tool_manager,
+                    model=resolved.model,
+                    tool_manager=resolved.tool_manager,
+                    owns_media=owns_media,
                     instrumentation=resolved.instrumentation_settings,
-                    model_name=resolved.model.model_name,
-                    provider_name=resolved.model.system,
-                    provider_url=resolved.model.base_url,
                     # Fall back to 'agent' like the classic run span (see `capabilities/instrumentation.py`)
                     # so the session span always carries an `agent_name`; backends that group runs by it
                     # (e.g. Logfire's Runs view) would otherwise skip an unnamed agent's realtime session.
@@ -3630,8 +3629,6 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     retain_images_every_n=retain_images_every_n,
                     retain_images_max=retain_images_max,
                     message_history=message_history,
-                    profile=resolved.model_profile,
-                    owns_media=owns_media,
                     conversation_id=resolved.conversation_id,
                     run_id=resolved.run_id,
                     instructions=resolved.instructions,
@@ -3903,7 +3900,7 @@ def _validate_native_tool_ids(native_tools: Sequence[AgentNativeTool[Any]], *, s
 
 @dataclasses.dataclass
 class _ResolvedRunCapabilities(Generic[AgentDepsT]):
-    """The per-run capability state shared by `run`/`iter` and `_open_realtime_session`.
+    """The per-run capability state shared by `run`/`iter` and `realtime_session`.
 
     Produced by [`Agent._resolve_run_capabilities`][]: the resolved capability tree plus the
     contributions extracted from it (instructions, native tools, model settings, toolsets), so both a
@@ -3934,7 +3931,7 @@ def _layer_model_settings(
     Each layer is a static `ModelSettings`, a callable resolved against the run context, or `None`.
     Stamping the merged-so-far onto `run_context.model_settings` before a callable layer runs lets it
     observe the previous layers — the agent -> capability -> run order both `iter` (per model-request
-    step) and `_open_realtime_session` (once, at connect) rely on. `base` is the model's own settings for a
+    step) and `realtime_session` (once, at connect) rely on. `base` is the model's own settings for a
     graph run; a realtime model has none, so it defaults to `None`.
     """
     merged = base

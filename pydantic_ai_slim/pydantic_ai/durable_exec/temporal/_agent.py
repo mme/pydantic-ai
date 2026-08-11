@@ -56,7 +56,12 @@ from ._activity_execution import execute_activity
 from ._durability import serialization_user_error
 from ._model import TemporalModel, TemporalProviderFactory
 from ._run_context import TemporalRunContext, deserialize_run_context
-from ._toolset import temporalize_toolset, toolset_temporal_activities
+from ._toolset import (
+    PAYLOAD_SIZE_ERROR_TYPE,
+    temporalize_toolset,
+    toolset_temporal_activities,
+    with_non_retryable_errors,
+)
 
 if TYPE_CHECKING:
     from pydantic_ai.agent.spec import AgentSpec
@@ -68,6 +73,19 @@ if TYPE_CHECKING:
         RealtimeProviderSession,
         RealtimeSession,
     )
+
+
+def _merge_activity_config(base: ActivityConfig, override: ActivityConfig) -> ActivityConfig:
+    """Merge an override onto the base config without losing the base policy's non-retryable errors.
+
+    The base config's `retry_policy` is normalized with the non-retryable error types (`UserError`,
+    over-limit payloads), but a `retry_policy` in the override replaces it wholesale — so the merged
+    policy must be re-normalized or an oversized payload would be retried forever.
+    """
+    merged = base | override
+    if 'retry_policy' in override:
+        merged['retry_policy'] = with_non_retryable_errors(merged.get('retry_policy'))
+    return merged
 
 
 @dataclass
@@ -172,12 +190,14 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             else ActivityConfig(start_to_close_timeout=timedelta(seconds=60))
         )
 
-        # `pydantic_ai.exceptions.UserError` and `pydantic.errors.PydanticUserError` are not retryable
+        # `pydantic_ai.exceptions.UserError` and `pydantic.errors.PydanticUserError` are not retryable,
+        # and neither is an over-limit payload, which would otherwise be resent forever (#7110).
         retry_policy = copy.copy(activity_config.get('retry_policy') or RetryPolicy())
         retry_policy.non_retryable_error_types = [
             *(retry_policy.non_retryable_error_types or []),
             UserError.__name__,
             PydanticUserError.__name__,
+            PAYLOAD_SIZE_ERROR_TYPE,
         ]
         activity_config['retry_policy'] = retry_policy
         self.activity_config = activity_config
@@ -217,7 +237,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         temporal_model = TemporalModel(
             wrapped_model,
             activity_name_prefix=activity_name_prefix,
-            activity_config=activity_config | model_activity_config,
+            activity_config=_merge_activity_config(activity_config, model_activity_config),
             deps_type=self.deps_type,
             run_context_type=self.run_context_type,
             event_stream_handler=self.event_stream_handler,
@@ -238,7 +258,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             args: tuple[Any, ...] = (
                 toolset,
                 activity_name_prefix,
-                activity_config | toolset_activity_config.get(id, {}),
+                _merge_activity_config(activity_config, toolset_activity_config.get(id, {})),
                 tool_activity_config.get(id, {}),
                 self.deps_type,
                 self.run_context_type,

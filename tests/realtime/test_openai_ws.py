@@ -2,7 +2,7 @@
 
 These complement the network-free `test_openai.py` unit tests: the fakes there pin event mapping and
 send/handshake logic cheaply, while these replay recorded provider frames end-to-end through
-[`Agent.realtime`][pydantic_ai.agent.Agent.realtime] to prove the real protocol —
+[`Agent.realtime_session`][pydantic_ai.agent.Agent.realtime_session] to prove the real protocol —
 the streamed part events, the tool round-trip, and message-history seeding. Recorded once against the
 live API with `--record-mode=rewrite`, then replayed offline forever.
 """
@@ -32,6 +32,7 @@ from pydantic_ai.messages import (
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
+    RealtimeSessionErrorEvent,
     SpeechPart,
     SpeechPartDelta,
     TextPart,
@@ -40,45 +41,12 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.realtime import RealtimeModelProfile, RealtimeOutputSpeechEndEvent, RealtimeTurnCompleteEvent
-from pydantic_ai.realtime._base import RealtimeSessionErrorEvent
 from pydantic_ai.usage import RunUsage
 
 from ..conftest import IsDatetime, IsStr, try_import
+from .conftest import REAL_SDP_OFFER
 from .ws_cassettes import RealtimeCassette
 from .ws_helpers import collapse_event_types, sent_frames_containing
-
-# A complete WebRTC SDP offer (audio + data-channel sections) that the realtime `/realtime/calls`
-# endpoint accepts. Media never actually flows from it — this is only enough for the provider to create
-# the call and return a `call_id` for the sideband control connection to attach to. A recording that
-# needs the provider to report playback needs real media, and uses `_webrtc_media_peer` instead.
-SAMPLE_WEBRTC_SDP_OFFER = """v=0
-o=- 3984138995 3984138995 IN IP4 192.0.2.10
-s=-
-t=0 0
-a=group:BUNDLE 0 1
-a=msid-semantic:WMS *
-m=audio 55983 UDP/TLS/RTP/SAVPF 96 0 8
-c=IN IP4 198.51.100.20
-a=sendrecv
-a=mid:0
-a=rtcp-mux
-a=rtpmap:96 opus/48000/2
-a=rtpmap:0 PCMU/8000
-a=rtpmap:8 PCMA/8000
-a=ice-ufrag:JCSJ
-a=ice-pwd:4VjSN9HmbfuizcxBRohAKf
-a=fingerprint:sha-256 A4:48:06:9B:5F:3C:23:B7:FF:02:08:A2:30:6A:BB:39:D3:0E:5A:8D:3E:EB:B9:BA:AC:91:C0:AD:3F:A1:46:B8
-a=setup:actpass
-m=application 57304 UDP/DTLS/SCTP webrtc-datachannel
-c=IN IP4 198.51.100.20
-a=mid:1
-a=sctp-port:5000
-a=max-message-size:65536
-a=ice-ufrag:xNB3
-a=ice-pwd:imPFbPwvIpZaDrxqpdwWiI
-a=fingerprint:sha-256 A4:48:06:9B:5F:3C:23:B7:FF:02:08:A2:30:6A:BB:39:D3:0E:5A:8D:3E:EB:B9:BA:AC:91:C0:AD:3F:A1:46:B8
-a=setup:actpass
-"""
 
 with try_import() as imports_successful:
     from pydantic_ai.providers import Provider
@@ -98,75 +66,6 @@ pytestmark = [
     pytest.mark.anyio,
     pytest.mark.skipif(not imports_successful(), reason='openai / websockets not installed'),
 ]
-
-# Applies the provider's WebRTC answer to the media peer, connecting the audio path.
-MediaConnect = Callable[[str], Awaitable[None]]
-
-
-async def _no_media_to_connect(answer_sdp: str) -> None:
-    """Replay's `MediaConnect`: the recorded control frames already carry the playback boundaries."""
-
-
-@asynccontextmanager
-async def _live_webrtc_media_peer() -> AsyncGenerator[tuple[str, MediaConnect]]:  # pragma: no cover
-    """Negotiate a real WebRTC call with `aiortc`, standing in for the browser that owns the media.
-
-    Recording only — see `_webrtc_media_peer`. `aiortc` is not a project dependency (it pulls in a
-    media stack no offline test needs), so it's imported dynamically and installed ad hoc when
-    recording: `uv run --with aiortc --env-file .env pytest ... --record-mode=rewrite`.
-    """
-    aiortc = importlib.import_module('aiortc')
-    mediastreams = importlib.import_module('aiortc.mediastreams')
-
-    # No STUN server: a server-reflexive candidate would put the recorder's own public address in the
-    # cassette, and OpenAI's ICE-lite endpoint is reachable from the host candidates alone.
-    pc = aiortc.RTCPeerConnection(aiortc.RTCConfiguration(iceServers=[]))
-    pc.addTrack(mediastreams.AudioStreamTrack())
-
-    @pc.on('track')
-    def _drain_inbound_audio(track: Any) -> None:
-        # The provider stops filling its output buffer if nobody reads the track, which would cut the
-        # playback window this recording exists to capture.
-        async def pump() -> None:
-            while True:
-                try:
-                    await track.recv()
-                except Exception:
-                    return
-
-        asyncio.ensure_future(pump())
-
-    await pc.setLocalDescription(await pc.createOffer())
-    while pc.iceGatheringState != 'complete':
-        await anyio.sleep(0.1)
-
-    async def connect(answer_sdp: str) -> None:
-        await pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=answer_sdp, type='answer'))
-
-    try:
-        yield pc.localDescription.sdp, connect
-    finally:
-        await pc.close()
-
-
-@asynccontextmanager
-async def _webrtc_media_peer(*, recording: bool) -> AsyncGenerator[tuple[str, MediaConnect]]:
-    """The browser side of a WebRTC call, as `(offer_sdp, connect)`.
-
-    The provider reports playback boundaries (`output_audio_buffer.*`, and so the `OutputSpeech*`
-    events) only while media is actually flowing: it answers a canned offer that never completes ICE
-    quite happily, but then never sends a single playback frame. So a recording that is to contain
-    them needs a real peer, which `aiortc` negotiates headlessly.
-
-    Replay needs no peer at all — the cassette holds the frames, and dialling a recorded answer's
-    long-dead ICE candidates would put real UDP traffic in an offline test — so it reuses the canned
-    offer and connects nothing. The recorded offer is never matched on, so the two are interchangeable.
-    """
-    if recording:  # pragma: no cover
-        async with _live_webrtc_media_peer() as peer:
-            yield peer
-        return
-    yield SAMPLE_WEBRTC_SDP_OFFER, _no_media_to_connect
 
 
 async def test_text_in_audio_out_turn(openai_ws_cassette: tuple[Provider[Any], RealtimeCassette]) -> None:
@@ -495,7 +394,7 @@ async def test_tool_call_round(openai_ws_cassette: tuple[Provider[Any], Realtime
 
     # Usage from BOTH provider responses is accounted for. The intermediate function-call-only
     # response's `response.done` maps to no turn event (the turn isn't over), but its tokens are
-    # still counted — the connection emits a `SessionUsageEvent` for every `response.done`, so a
+    # still counted — the connection emits a `SessionUsage` for every `response.done`, so a
     # tool-calling turn reports two usage updates, not just the final text response's.
     assert session.usage.requests == 2
     assert session.usage.input_tokens > 0 and session.usage.output_tokens > 0
@@ -589,9 +488,80 @@ def test_profile_allow_seeding() -> None:
         supports_async_tool_calls=True,  # the realtime models keep talking through a tool call
         supports_tool_return_schema=False,  # no native surface; opted-in schemas go into descriptions
         supported_native_tools=frozenset(),
+        emits_input_speech_events=True,
         audio_input_sample_rate=24000,
         audio_output_sample_rate=24000,
     )
+
+
+# Applies the provider's WebRTC answer to the media peer, connecting the audio path.
+MediaConnect = Callable[[str], Awaitable[None]]
+
+
+async def _no_media_to_connect(answer_sdp: str) -> None:
+    """Replay's `MediaConnect`: the recorded control frames already carry the playback boundaries."""
+
+
+@asynccontextmanager
+async def _live_webrtc_media_peer() -> AsyncGenerator[tuple[str, MediaConnect]]:  # pragma: no cover
+    """Negotiate a real WebRTC call with `aiortc`, standing in for the browser that owns the media.
+
+    Recording only — see `_webrtc_media_peer`. `aiortc` is not a project dependency (it pulls in a
+    media stack no offline test needs), so it's imported dynamically and installed ad hoc when
+    recording: `uv run --with aiortc --env-file .env pytest ... --record-mode=rewrite`.
+    """
+    aiortc = importlib.import_module('aiortc')
+    mediastreams = importlib.import_module('aiortc.mediastreams')
+
+    # No STUN server: a server-reflexive candidate would put the recorder's own public address in the
+    # cassette, and OpenAI's ICE-lite endpoint is reachable from the host candidates alone.
+    pc = aiortc.RTCPeerConnection(aiortc.RTCConfiguration(iceServers=[]))
+    pc.addTrack(mediastreams.AudioStreamTrack())
+
+    @pc.on('track')
+    def _drain_inbound_audio(track: Any) -> None:
+        # The provider stops filling its output buffer if nobody reads the track, which would cut the
+        # playback window this recording exists to capture.
+        async def pump() -> None:
+            while True:
+                try:
+                    await track.recv()
+                except Exception:
+                    return
+
+        asyncio.ensure_future(pump())
+
+    await pc.setLocalDescription(await pc.createOffer())
+    while pc.iceGatheringState != 'complete':
+        await anyio.sleep(0.1)
+
+    async def connect(answer_sdp: str) -> None:
+        await pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=answer_sdp, type='answer'))
+
+    try:
+        yield pc.localDescription.sdp, connect
+    finally:
+        await pc.close()
+
+
+@asynccontextmanager
+async def _webrtc_media_peer(*, recording: bool) -> AsyncGenerator[tuple[str, MediaConnect]]:
+    """The browser side of a WebRTC call, as `(offer_sdp, connect)`.
+
+    The provider reports playback boundaries (`output_audio_buffer.*`, and so the `OutputSpeech*`
+    events) only while media is actually flowing: it answers a canned offer that never completes ICE
+    quite happily, but then never sends a single playback frame. So a recording that is to contain
+    them needs a real peer, which `aiortc` negotiates headlessly.
+
+    Replay needs no peer at all — the cassette holds the frames, and dialling a recorded answer's
+    long-dead ICE candidates would put real UDP traffic in an offline test — so it reuses the canned
+    offer and connects nothing. The recorded offer is never matched on, so the two are interchangeable.
+    """
+    if recording:  # pragma: no cover
+        async with _live_webrtc_media_peer() as peer:
+            yield peer
+        return
+    yield REAL_SDP_OFFER, _no_media_to_connect
 
 
 @pytest.mark.vcr
@@ -611,7 +581,7 @@ async def test_webrtc_sideband_text_turn(
     )
     agent = Agent(instructions='Answer in two words.')
 
-    answer = await model.answer_webrtc_offer(SAMPLE_WEBRTC_SDP_OFFER, instructions='Answer in two words.')
+    answer = await model.answer_webrtc_offer(REAL_SDP_OFFER, instructions='Answer in two words.')
     assert answer.sdp.startswith('v=0')
     assert answer.session.provider_name == 'openai'
     assert answer.session.call_id.startswith('rtc_')

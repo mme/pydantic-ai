@@ -1,11 +1,11 @@
-Example of a voice assistant built on a [realtime](../realtime/index.md) speech-to-speech model: it
+Example of a voice assistant built on a [realtime](../realtime/overview.md) speech-to-speech model: it
 streams your microphone to OpenAI's `gpt-realtime` model and plays the model's spoken replies back
 through your speakers. Talk to it — and try interrupting while it's speaking: the model stops and
 listens (barge-in).
 
 Demonstrates:
 
-- [realtime sessions](../realtime/index.md)
+- [realtime sessions](../realtime/overview.md)
 - [tools](../tools.md)
 - [barge-in](../realtime/turns.md#barge-in) (interrupting the model mid-sentence)
 
@@ -21,8 +21,9 @@ Barge-in itself is handled by the provider — the model stops as soon as the us
 example adds is the half the provider can't see: it clears queued *and* partially consumed playback
 audio, then reports the duration actually played to
 [`interrupt()`][pydantic_ai.realtime.RealtimeSession.interrupt], so the provider truncates its
-transcript to what the user really heard rather than the whole turn. It only does so when audio was
-actually playing, since the speech-start event also fires on an ordinary turn.
+transcript to what the user really heard rather than the whole turn. It only does so when unheard
+audio was actually dropped, since the speech-start event also fires on an ordinary turn where the
+user heard the previous reply in full.
 
 ## Running the Example
 
