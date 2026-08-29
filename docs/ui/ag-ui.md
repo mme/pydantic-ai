@@ -40,7 +40,7 @@ There are three ways to run a Pydantic AI agent based on AG-UI run input with st
 When a run ends in [first-party cancellation](../agent.md#cancelling-a-run) — `ctx.cancel()`, `AgentRun.cancel()`, or a [`CancellationToken`][pydantic_ai.CancellationToken] your server wires to a cancel endpoint — the adapter closes any open text or tool events and emits a bare `RUN_FINISHED`. AG-UI currently has no cancelled outcome, so cancellation is not reported as `RUN_ERROR`. Pass an `on_cancel` callback (see the `run_stream()` example below) to persist the resumable message history from [`RunCancelled.all_messages()`][pydantic_ai.exceptions.RunCancelled.all_messages].
 
 !!! note "Client disconnects are external cancellation"
-    A client that disconnects (or aborts its request) is seen by the server as an external `asyncio.CancelledError` rather than a first-party cancellation (see [why cancellation arrives in two shapes](../agent.md#cancelling-a-run)), so the bare `RUN_FINISHED` and `on_cancel` do not fire on a disconnect. To observe a stop gesture this way, keep the stream connected and cancel the run first-party via a [`CancellationToken`][pydantic_ai.CancellationToken] triggered from a separate cancel endpoint.
+    A client that disconnects (or aborts its request) is seen by the server as an external `asyncio.CancelledError` rather than a first-party cancellation (see [the two kinds of cancellation](../agent.md#cancelling-a-run)), so the bare `RUN_FINISHED` and `on_cancel` do not fire on a disconnect. To observe a stop gesture this way, keep the stream connected and cancel the run first-party via a [`CancellationToken`][pydantic_ai.CancellationToken] triggered from a separate cancel endpoint.
 
 ### Handle run input and output directly
 
@@ -262,6 +262,7 @@ Read the entries off `adapter.run_input.context` and deliver them to the model a
 from dataclasses import dataclass
 
 from ag_ui.core import Context
+from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -276,6 +277,7 @@ class ChannelDeps:
 
 
 agent = Agent('openai:gpt-5.2', deps_type=ChannelDeps)
+app = FastAPI()
 
 
 @agent.instructions
@@ -294,6 +296,7 @@ def authenticated_workspace(request: Request) -> str:
     ...
 
 
+@app.post('/')
 async def run_agent(request: Request) -> Response:
     adapter = await AGUIAdapter.from_request(request, agent=agent)
     deps = ChannelDeps(workspace=authenticated_workspace(request), context=adapter.run_input.context)
@@ -306,6 +309,8 @@ async def run_agent(request: Request) -> Response:
 To let a client-supplied fact change how the agent behaves, authenticate it first: verify the caller or channel, look up the policy *your* server holds for it, and write the instruction from that. The entry itself stays data.
 
 Anything that isn't meant for the model at all — a Slack channel ID, a locale — is better carried in `forwardedProps`, which the adapter passes through untouched as `adapter.run_input.forwarded_props`. Validating it proves shape, not identity: who the user is, what tenant they're in, and what they're allowed to do come from authenticated server state.
+
+When the agent's events reach you outside the request that serves the frontend, there's no run input to read them off at all — see ["Encoding events without a request"](./overview.md#encoding-events-without-a-request), where [`AGUIEventStream.thread_id`][pydantic_ai.ui.ag_ui.AGUIEventStream.thread_id] and [`run_id`][pydantic_ai.ui.ag_ui.AGUIEventStream.run_id] take over as the source of the identity the protocol requires.
 
 `context`, `forwardedProps` and `parentRunId` are read straight off [`run_input`][pydantic_ai.ui.UIAdapter.run_input] rather than through adapter properties of their own. The adapter's properties — `messages`, `toolset`, `state`, `conversation_id`, `deferred_tool_results` — are the concepts every UI protocol shares and that the adapter itself feeds into the agent run. These three are AG-UI-specific and consumed only by your code, so they stay on the protocol object where their types are the protocol's own.
 
@@ -504,6 +509,42 @@ async def run_agent(request: Request) -> Response:
         request, agent=agent, manage_system_prompt='client'
     )
 ```
+
+## Channels
+
+The agent you exposed over AG-UI can also power a bot in Slack or another messaging platform. The [CopilotKit Channels SDK](https://docs.copilotkit.ai/slack/pydantic-ai) receives platform events, runs your agent over AG-UI, and renders its response as native platform content.
+
+!!! note
+    CopilotKit maintains the platform setup and deployment instructions. This section shows the Pydantic AI integration; use the [CopilotKit Slack guide for Pydantic AI](https://docs.copilotkit.ai/slack/pydantic-ai/connect) for the complete walkthrough.
+
+### How it fits together
+
+For managed Slack, [CopilotKit Intelligence](https://docs.copilotkit.ai/slack/pydantic-ai) holds the Slack credentials and delivers each turn to a long-running Node process built with [`@copilotkit/channels`](https://www.npmjs.com/package/@copilotkit/channels). That process sends the conversation to your Pydantic AI server over AG-UI and returns the streamed response to Slack.
+
+```
+Slack  ──►  CopilotKit Intelligence  ──►  channel process (Node)  ──►  Pydantic AI server (AG-UI)
+```
+
+Follow the [CopilotKit guide](https://docs.copilotkit.ai/slack/pydantic-ai/connect) to create the channel process and point its AG-UI client at your Pydantic AI server. When the process handles a platform event, it passes the triggering message to the agent and can attach platform and user details as AG-UI `context` entries.
+
+AG-UI `context` is client-provided data, so Pydantic AI deliberately does not put it in the model prompt automatically. Run the channel process alongside the [`ag_ui_context.py`](#context) server above: it reads `adapter.run_input.context`, keeps authenticated workspace data separate, and exposes the channel entries through the `frontend_context` tool rather than treating them as instructions.
+
+```bash
+uvicorn ag_ui_context:app
+```
+
+Start the channel process as described in the CopilotKit guide. It needs a long-running host because a serverless request handler cannot own its persistent gateway connection.
+
+### Slack
+
+The managed Slack connection is configured in CopilotKit Intelligence, which walks you through creating the Slack app and holds its credentials. Mention the bot in a real workspace and test a direct message to verify the platform connection, gateway listener, AG-UI server, and reply path together.
+
+### Other platforms
+
+Managed and developer-operated connections have different setup and support. See the [Channels SDK reference](https://docs.copilotkit.ai/reference/channels) for the current managed platforms, direct adapters, and provider-specific guides.
+
+!!! note
+    CopilotKit Intelligence reconstructs managed conversation history, but SDK workflow state and interactive callback snapshots use an in-memory store by default. Configure a durable store before promising restart-safe state or interactions; see [Persistence and scaling](https://docs.copilotkit.ai/slack/pydantic-ai/persistence-and-scaling).
 
 ## Examples
 
